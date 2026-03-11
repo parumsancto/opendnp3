@@ -679,6 +679,12 @@ IINField OContext::HandleNonReadResponse(const APDUHeader& header, const ser4cpp
         return this->HandleFreeze(objects);
     case (FunctionCode::FREEZE_CLEAR):
         return this->HandleFreezeAndClear(objects);
+    case (FunctionCode::AUTH_REQUEST):
+        this->application->OnAuthRequest(objects, objects.length());
+        return IINField::Empty();
+    case (FunctionCode::AUTH_REQUEST_NO_ACK):
+        this->application->OnAuthRequestNoAck(objects, objects.length());
+        return IINField::Empty();
     default:
         return IINField(IINBit::FUNC_NOT_SUPPORTED);
     }

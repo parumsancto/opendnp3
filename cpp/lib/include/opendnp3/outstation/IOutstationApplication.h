@@ -137,6 +137,20 @@ public:
     /// @param num_class3 number of Class 3 events remaining in the event buffer after processing the confirm
     virtual void OnConfirmProcessed(bool is_unsolicited, uint32_t num_class1, uint32_t num_class2, uint32_t num_class3) {}
 
+    /**
+     * Called when an AUTH_REQUEST (fc=0x20, Group 120) is received from master.
+     * @param data   Pointer to the raw application layer payload (after function code byte)
+     * @param length Length of the payload in bytes
+     */
+    virtual void OnAuthRequest(const uint8_t* data, size_t length) {}
+
+    /**
+     * Called when an AUTH_REQUEST_NO_ACK (fc=0x21, Group 120) is received from master.
+     * @param data   Pointer to the raw application layer payload (after function code byte)
+     * @param length Length of the payload in bytes
+     */
+    virtual void OnAuthRequestNoAck(const uint8_t* data, size_t length) {}
+
     virtual ~IOutstationApplication() = default;
 };
 

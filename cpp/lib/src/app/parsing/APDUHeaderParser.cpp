@@ -34,7 +34,7 @@ APDUHeaderParser::Result<APDUHeader> APDUHeaderParser::ParseRequest(const ser4cp
 {
     if (apdu.length() < APDUHeader::REQUEST_SIZE)
     {
-        FORMAT_LOGGER_BLOCK(logger, flags::WARN, "Request fragment  with insufficient size of %zu bytes",
+        FORMAT_LOGGER_BLOCK(logger, flags::WARN, "Request fragment with insufficient size of %zu bytes",
                             apdu.length());
         return Result<APDUHeader>::Error();
     }
@@ -48,7 +48,7 @@ APDUHeaderParser::Result<APDUResponseHeader> APDUHeaderParser::ParseResponse(con
 {
     if (apdu.length() < APDUHeader::RESPONSE_SIZE)
     {
-        FORMAT_LOGGER_BLOCK(logger, flags::WARN, "Response fragment  with insufficient size of %zu bytes",
+        FORMAT_LOGGER_BLOCK(logger, flags::WARN, "Response fragment with insufficient size of %zu bytes",
                             apdu.length());
         return Result<APDUResponseHeader>::Error();
     }
