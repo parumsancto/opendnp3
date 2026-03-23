@@ -42,8 +42,20 @@
 
 #include <ser4cpp/container/Pair.h>
 #include <ser4cpp/container/Settable.h>
-
 #include <exe4cpp/IExecutor.h>
+
+// ============================================================
+// SAv5 INTEGRATION: Add Secure Authentication components
+// ============================================================
+#include "opendnp3/app/secauth/SAResponder.h"
+#include "opendnp3/app/secauth/SAChallenger.h"
+#include "opendnp3/app/secauth/SAKeyManager.h"
+
+#include <functional>
+#include <memory>
+#include <map>
+
+#include <ser4cpp/container/Buffer.h>
 
 namespace opendnp3
 {
@@ -112,6 +124,74 @@ private:
     bool ProcessRequestNoAck(const ParsedRequest& request);
 
     bool ProcessConfirm(const ParsedRequest& request);
+
+    // ============================================================
+    // SAv5 INTEGRATION: Secure Authentication message handling
+    // ============================================================
+
+    /**
+     * @brief Handle AUTH_REQUEST (FC 0x20) messages
+     * @details Processes g120vX objects:
+     *   - v4 Key Status Request → saKeyManager
+     *   - v6 Key Change → saKeyManager
+     *   - v2 Aggressive Mode Response → saChallenger
+     * 
+     * IEEE 1815-2012 Section 7.5.5
+     * 
+     * @param request Parsed AUTH_REQUEST with g120vX objects
+     * @return true if handled successfully
+     */
+    bool OnReceiveSAMessage(const ParsedRequest& request);
+
+    /**
+     * @brief Check if function code requires authentication
+     * @details Critical functions per IEEE 1815-2012 Table 7-1:
+     *   - WRITE, SELECT, OPERATE, DIRECT_OPERATE
+     *   - COLD_RESTART, WARM_RESTART
+     *   - ENABLE_UNSOLICITED, DISABLE_UNSOLICITED
+     * 
+     * @param fc Function code to check
+     * @return true if critical (requires auth), false if non-critical
+     */
+    bool IsCriticalFunction(FunctionCode fc) const;
+
+    /**
+     * @brief Initiate challenge-response for critical function
+     * @details Per IEEE 1815-2012 Figure 7-2:
+     *   1. Queue incoming critical APDU
+     *   2. Generate challenge via SAChallenger
+     *   3. Send g120v1 Challenge to master
+     *   4. Wait for g120v2 Aggressive Mode Response
+     * 
+     * @param request Critical function request to protect
+     * @return true if challenge sent successfully
+     */
+    bool InitiateChallengeForCriticalFunction(const ParsedRequest& request);
+
+    /**
+     * @brief Send g120v5 Key Status response
+     * @details Called in response to g120v4 Key Status Request
+     * 
+     * @param userNum User number
+     * @param keyStatusBytes g120v5 Key Status payload
+     */
+    void SendKeyStatusResponse(uint16_t userNum, const std::vector<uint8_t>& keyStatusBytes);
+
+    /**
+     * @brief Send g120v1 Challenge
+     * @details Challenge-response authentication flow
+     * 
+     * @param challengeBytes g120v1 Challenge payload
+     */
+    void SendChallengeMessage(const std::vector<uint8_t>& challengeBytes);
+
+    /**
+     * @brief Execute pending critical APDU after successful authentication
+     * @details Called when:
+     *   - g120v2 Aggressive Mode Response validated successfully
+     *   - Session keys updated via g120v6 Key Change
+     */
+    void ExecutePendingCriticalAPDU();
 
     // ---- common helper methods ----
 
@@ -213,7 +293,43 @@ private:
     OutstationState* state = &StateIdle::Inst();
 
     // ------ Dynamic state related to broadcast messages ------
+    //ser4cpp::Settable<uint16_t> lastBroadcastMessageReceived;
     ser4cpp::Settable<LinkBroadcastAddress> lastBroadcastMessageReceived;
+
+    // ============================================================
+    // SAv5 INTEGRATION: Secure Authentication state
+    // ============================================================
+
+    /// @brief SAv5 components (initialized if saEnabled = true)
+    std::unique_ptr<SAResponder> saResponder;
+    std::unique_ptr<SAChallenger> saChallenger;
+    std::unique_ptr<SAKeyManager> saKeyManager;
+    std::map<uint16_t, std::array<uint8_t, 32>> sessionControlKeys;  // CDK
+    std::map<uint16_t, std::array<uint8_t, 32>> sessionMonitorKeys;  // MDK
+    // SAv5: raw transmit buffer for AUTH_RESPONSE (bypasses HeaderWriter).
+    // Must outlive BeginTx() until OnTxReady() fires (async TX).
+    static constexpr size_t SA_TX_BUFFER_SIZE = 2048;
+    std::array<uint8_t, SA_TX_BUFFER_SIZE> saTxBuffer_;
+
+    /// @brief Is Secure Authentication enabled?
+    bool saEnabled;
+
+    /// @brief Pending critical APDU awaiting authentication
+    /// @details Stores serialized APDU bytes to execute after successful auth
+    std::vector<uint8_t> pendingCriticalAPDU;
+    /// @brief Original source/destination addresses of the intercepted critical request.
+    /// @details Used in ExecutePendingCriticalAPDU so the WRITE response is routed back
+    ///          to the master (src=master, dst=outstation), not to the outstation itself.
+    Addresses pendingCriticalAddresses;
+    /// @brief Full AL fragment of g120v1 challenge sent to master (for MAC validation)
+    /// @details IEEE 1815-2012 Table A-3: MAC input includes the complete challenge message
+    std::vector<uint8_t> pendingChallengeAPDU;
+
+    /// @brief User number of pending critical request
+    uint16_t pendingCriticalUserNum;
+
+    bool saKeyExchangeInProgress = false; // true during SA Key Exchange, blocks unsolicited
+    bool executingAuthenticatedAPDU = false; 
 };
 
 } // namespace opendnp3

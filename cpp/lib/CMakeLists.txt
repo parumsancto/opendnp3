@@ -29,6 +29,12 @@ set(opendnp3_public_headers
 
     ./include/opendnp3/app/parsing/ICollection.h
 
+    ./include/opendnp3/app/secauth/Group120Parser.h
+    ./include/opendnp3/app/secauth/Group120Builder.h
+    ./include/opendnp3/app/secauth/SAResponder.h
+    ./include/opendnp3/app/secauth/SAChallenger.h
+    ./include/opendnp3/app/secauth/SAKeyManager.h
+
     ./include/opendnp3/channel/ChannelRetry.h
     ./include/opendnp3/channel/IChannel.h
     ./include/opendnp3/channel/IChannelListener.h
@@ -659,7 +665,19 @@ set(opendnp3_tls_src
     ./src/channel/tls/TLSStreamChannel.cpp
 )
 
-set(all_sources ${opendnp3_public_headers} ${opendnp3_private_headers} ${opendnp3_src})
+# Secure Authentication support
+set(secauth_src
+    src/app/secauth/Group120Parser.cpp
+    src/app/secauth/Group120Builder.cpp
+    src/app/secauth/SAResponder.cpp
+    src/app/secauth/SAChallenger.cpp
+    src/app/secauth/SAKeyManager.cpp
+)
+
+# Link OpenSSL
+find_package(OpenSSL REQUIRED)
+
+set(all_sources ${opendnp3_public_headers} ${opendnp3_private_headers} ${opendnp3_src} ${secauth_src})
 if(DNP3_TLS)
     list(APPEND all_sources ${opendnp3_tls_private_headers} ${opendnp3_tls_src})
 endif()
@@ -668,11 +686,14 @@ source_group(TREE ${CMAKE_CURRENT_SOURCE_DIR} FILES ${all_sources})
 
 add_library(opendnp3 ${all_sources})
 target_compile_features(opendnp3 PUBLIC cxx_std_14)
-target_link_libraries(opendnp3 PRIVATE
-    $<BUILD_INTERFACE:ser4cpp>
-    $<BUILD_INTERFACE:exe4cpp>
-    $<BUILD_INTERFACE:asio>
-    $<$<BOOL:${DNP3_TLS}>:OpenSSL::SSL>
+target_link_libraries(opendnp3
+    PRIVATE
+        $<BUILD_INTERFACE:ser4cpp>
+        $<BUILD_INTERFACE:exe4cpp>
+        $<BUILD_INTERFACE:asio>
+    PUBLIC
+        OpenSSL::SSL
+        OpenSSL::Crypto
 )
 target_include_directories(opendnp3
     PUBLIC

@@ -73,6 +73,32 @@ struct OutstationParams
     /// If true, the outstation processes responds to any request/confirmation as if it came from the expected master
     /// address
     bool respondToAnyMaster = false;
+
+    /**
+     * @brief Enable Secure Authentication v5
+     * @details Set to true to activate SAv5 protocol
+     * Requires saUpdateKey to be configured
+     */
+    bool saEnabled = false;
+
+    /**
+     * @brief Update Key for Session Key encryption
+     * @details 32-byte AES-256 key used to wrap/unwrap session keys
+     * 
+     * IEEE 1815-2012 Section 7.5.5.3:
+     * - Pre-shared or remotely changed via Update Key Change
+     * - Used with AES-256 Key Wrap (RFC 3394)
+     * - All zeros = SA disabled
+     * 
+     * Configuration example:
+     * ```cpp
+     * std::array<uint8_t, 32> updateKey;
+     * // Load from secure storage
+     * config.outstation.params.saUpdateKey = updateKey;
+     * config.outstation.params.saEnabled = true;
+     * ```
+     */
+    std::array<uint8_t, 32> saUpdateKey = {}; // All zeros = SA disabled
 };
 
 } // namespace opendnp3

@@ -28,7 +28,7 @@
 namespace opendnp3
 {
 
-const uint32_t max_log_entry_size = 120;
+const uint32_t max_log_entry_size = 220;
 
 /**
  * A copyable facade over a LogRoot class
