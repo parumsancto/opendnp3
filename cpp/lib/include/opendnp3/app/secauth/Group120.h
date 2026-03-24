@@ -22,14 +22,18 @@ namespace opendnp3
 
 /**
  * @brief MAC Algorithm codes for authentication
- * @details IEEE 1815-2012 Table 7-4 (Challenge MAC Algorithm field)
+ * @details IEEE 1815-2012 MAC Algorithm codes (page 729)
  */
+// 
 enum class MACAlgorithm : uint8_t
 {
-    HMAC_SHA1_TRUNC_10   = 2,  ///< HMAC-SHA-1 truncated to 10 octets (deprecated)
-    HMAC_SHA256_TRUNC_16 = 3,  ///< HMAC-SHA-256 truncated to 16 octets (recommended)
-    HMAC_SHA256_TRUNC_8  = 4,  ///< HMAC-SHA-256 truncated to 8 octets
-    AES_GMAC             = 6   ///< AES-GMAC
+    NO_MAC               = 0,
+    HMAC_SHA1_TRUNC_4    = 1,
+    HMAC_SHA1_TRUNC_10   = 2,
+    HMAC_SHA256_TRUNC_8  = 3,
+    HMAC_SHA256_TRUNC_16 = 4,
+    HMAC_SHA1_TRUNC_8    = 5,
+    AES_GMAC             = 6
 };
 
 /**

@@ -108,7 +108,7 @@ std::vector<uint8_t> SAKeyManager::OnKeyStatusRequest(uint16_t userNum)
 
     // The initial Key Status response (before Key Change) has no MAC (MAL field
     // indicates what algorithm WILL BE used in the confirmation).
-    keyStatusBytes.push_back(0x02);  // MAL = 0x02 (HMAC-SHA256-8), was 0x03
+    keyStatusBytes.push_back(static_cast<uint8_t>(MACAlgorithm::HMAC_SHA1_TRUNC_10));
 
     std::ostringstream oss;
     oss << "Key Status Request: KSQ=" << ksq 
