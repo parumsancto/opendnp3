@@ -81,6 +81,7 @@ std::vector<uint8_t> SAKeyManager::GenerateRandomChallengeData()
     return challengeData;
 }
 
+
 std::vector<uint8_t> SAKeyManager::OnKeyStatusRequest(uint16_t userNum)
 {
     // IEEE 1815-2012 Section 7.5.5.2 (Step 1 of Figure 7-3)
@@ -231,7 +232,7 @@ std::vector<uint8_t> SAKeyManager::AESKeyUnwrap(const std::vector<uint8_t>& wrap
         return {};
     }
 
-    // Розпаковуємо весь wrappedData
+    // Unpack all wrappedData
     int result = AES_unwrap_key(&aesKey,
                                 nullptr, // стандартний IV 0xA6...A6
                                 unwrapped.data(),
@@ -347,23 +348,6 @@ bool SAKeyManager::OnKeyChange(const Group120Var6& keyChange,
     }
     Log("INFO", "CD_OS verification successful");
 
-    // TODO: remove debug logging
-    // DEBUG: log extracted CDK and MDK to verify key extraction offsets.
-    // {
-    //     std::ostringstream d;
-    //     d << "DEBUG CDK (bytes 2-17): ";
-    //     for (int i=0;i<16;i++) d<<std::hex<<std::setw(2)<<std::setfill('0')
-    //         <<(unsigned)unwrapped[CDK_OFFSET+i]<<(i<15?":":"");
-    //     Log("INFO", d.str());
-    // }
-    // {
-    //     std::ostringstream d;
-    //     d << "DEBUG MDK (bytes 18-33): ";
-    //     for (int i=0;i<16;i++) d<<std::hex<<std::setw(2)<<std::setfill('0')
-    //         <<(unsigned)unwrapped[MDK_OFFSET+i]<<(i<15?":":"");
-    //     Log("INFO", d.str());
-    // }
-
     // Витягуємо сесійні ключі з правильних зміщень
     controlKeyOut.fill(0);
     monitorKeyOut.fill(0);
@@ -379,146 +363,7 @@ bool SAKeyManager::OnKeyChange(const Group120Var6& keyChange,
     Log("INFO", oss.str());
     return true;
 }
-/*
-std::vector<uint8_t> SAKeyManager::BuildKeyStatusConfirmation(
-    uint16_t userNum,
-    const std::array<uint8_t, 32>& monitorKey,
-    MACAlgorithm macAlgo)
-{
-    // Generate NEW challenge data for the next authentication session.
-    // Per IEEE 1815-2012 §7.5.5.3: the Key Status sent after Key Change
-    // must contain fresh Challenge Data (not the one from the Key Change).
-    //lastChallengeData = GenerateRandomChallengeData();
-    // lastUserNum = userNum;
 
-    uint8_t macAlgoVal = static_cast<uint8_t>(macAlgo);
-
-    // Build MAC input per IEEE 1815-2012 Table A-6 (Key Status MAC input):
-    //   KSQ(4) | USR(2) | KWA(1) | KeyStatus(1) | MAL(1) | CDL(2) | CD(N)
-    std::vector<uint8_t> macInput;
-    auto pushU32LE = [&](uint32_t v) {
-        macInput.push_back( v        & 0xFF);
-        macInput.push_back((v >>  8) & 0xFF);
-        macInput.push_back((v >> 16) & 0xFF);
-        macInput.push_back((v >> 24) & 0xFF);
-    };
-    auto pushU16LE = [&](uint16_t v) {
-        macInput.push_back( v       & 0xFF);
-        macInput.push_back((v >> 8) & 0xFF);
-    };
-
-    pushU32LE(ksq_);
-    pushU16LE(userNum);
-    macInput.push_back(static_cast<uint8_t>(keyWrapAlgo));
-    macInput.push_back(static_cast<uint8_t>(KeyStatus::OK));
-    macInput.push_back(macAlgoVal);
-    pushU16LE(static_cast<uint16_t>(lastChallengeData.size()));
-    macInput.insert(macInput.end(), lastChallengeData.begin(), lastChallengeData.end());
-    //std::copy(lastChallengeData.begin(), lastChallengeData.end(), std::back_inserter(macInput));
-
-    // Compute HMAC-SHA256, truncate to 16 bytes per master config
-    unsigned char digest[EVP_MAX_MD_SIZE];
-    unsigned int  digestLen = 0;
-    HMAC(EVP_sha256(),
-         monitorKey.data(), 16,           // use only first 16 bytes of 32-byte key slot
-         macInput.data(),   macInput.size(),
-         digest,            &digestLen);
-
-    // Per IEEE 1815-2012 Table 7-5:
-    //   MAL 0x02 = HMAC-SHA256 truncated to 8 octets
-    //   MAL 0x03 = HMAC-SHA256 truncated to 16 octets (but many implementations treat as 8!)
-    constexpr size_t  MAC_TRUNC_LEN = 8;         // truncate to 8 bytes
-    std::vector<uint8_t> macValue;
-    if (digestLen >= MAC_TRUNC_LEN)
-        macValue.assign(digest, digest + MAC_TRUNC_LEN);
-    else
-        macValue.assign(digest, digest + digestLen); // safety fallback
-
-    // Build g120v5 object — Group120Builder calculates size from
-    // challengeData only; we must build the full serialized payload manually
-    // so that the 2-byte size field in qualifier 0x5B covers CD + MAC.
-    //
-    // g120v5 payload structure (qualifier 0x5B, object size N):
-    //   [0:3]  KSQ  (uint32 LE)
-    //   [4:5]  USR  (uint16 LE)
-    //   [6]    KWA
-    //   [7]    Key Status
-    //   [8]    MAL
-    //   [9:10] CDL  (uint16 LE)
-    //   [11 .. 11+CDL-1]  Challenge Data
-    //   [11+CDL .. 11+CDL+macLen-1]  MAC Value
-    const uint16_t cdl = static_cast<uint16_t>(lastChallengeData.size());
-    const uint16_t objSize = static_cast<uint16_t>(4 + 2 + 1 + 1 + 1 + 2 + cdl + macValue.size());
-
-    // DNP3 object header: Group(1) + Var(1) + Qualifier(1) + Count(1) + ObjSize(2)
-    std::vector<uint8_t> result;
-    result.reserve(6 + objSize);
-    result.push_back(0x78);  // Group 120
-    result.push_back(0x05);  // Variation 5
-    result.push_back(0x5B);  // Qualifier: 16-bit free-format
-    result.push_back(0x01);  // Count = 1
-    result.push_back( objSize        & 0xFF);
-    result.push_back((objSize >> 8)  & 0xFF);
-
-    // Object payload
-    auto appendU32LE = [&](uint32_t v) {
-        result.push_back( v        & 0xFF);
-        result.push_back((v >>  8) & 0xFF);
-        result.push_back((v >> 16) & 0xFF);
-        result.push_back((v >> 24) & 0xFF);
-    };
-    auto appendU16LE = [&](uint16_t v) {
-        result.push_back( v       & 0xFF);
-        result.push_back((v >> 8) & 0xFF);
-    };
-
-    appendU32LE(ksq_);                                          // KSQ
-    appendU16LE(userNum);                                       // USR
-    result.push_back(static_cast<uint8_t>(keyWrapAlgo));       // KWA
-    result.push_back(static_cast<uint8_t>(KeyStatus::OK));      // Key Status = OK
-    result.push_back(macAlgoVal);                               // MAL
-    appendU16LE(cdl);                                           // CDL
-    result.insert(result.end(), lastChallengeData.begin(), lastChallengeData.end()); // CD
-    result.insert(result.end(), macValue.begin(), macValue.end());                     // MAC
-
-    std::ostringstream oss;
-    oss << "Key Status Confirmation: KSQ=" << ksq_
-        << ", User=" << userNum
-        << ", Status=OK, MAC=" << macValue.size() << " bytes"
-        << ", CD=" << lastChallengeData.size() << " bytes";
-    Log("INFO", oss.str());
-
-    // TODO: remove debug log
-    // DEBUG: log MDK, MAC input and computed MAC to verify HMAC correctness.
-    // Remove after MAC verification is confirmed with master.
-    {
-        std::ostringstream dbg;
-        dbg << "DEBUG MAC key (MDK, first 16 bytes): ";
-        for (int i = 0; i < 16; ++i)
-            dbg << std::hex << std::setw(2) << std::setfill('0')
-                << static_cast<unsigned>(monitorKey[i]) << (i<15?":":"");
-        Log("INFO", dbg.str());
-    }
-    {
-        std::ostringstream dbg;
-        dbg << "DEBUG MAC input (" << macInput.size() << " bytes): ";
-        for (size_t i = 0; i < macInput.size(); ++i)
-            dbg << std::hex << std::setw(2) << std::setfill('0')
-                << static_cast<unsigned>(macInput[i]) << (i+1<macInput.size()?":":"");
-        Log("INFO", dbg.str());
-    }
-    {
-        std::ostringstream dbg;
-        dbg << "DEBUG MAC output (" << macValue.size() << " bytes): ";
-        for (size_t i = 0; i < macValue.size(); ++i)
-            dbg << std::hex << std::setw(2) << std::setfill('0')
-                << static_cast<unsigned>(macValue[i]) << (i+1<macValue.size()?":":"");
-        Log("INFO", dbg.str());
-    }
-
-    return result;
-}
-*/
 std::vector<uint8_t> SAKeyManager::BuildKeyStatusConfirmation(
     uint16_t userNum,
     const std::array<uint8_t, 32>& monitorKey,
@@ -578,40 +423,6 @@ std::vector<uint8_t> SAKeyManager::BuildKeyStatusConfirmation(
     result.push_back((cdl >> 8) & 0xFF);
     result.insert(result.end(), lastChallengeData.begin(), lastChallengeData.end());
     result.insert(result.end(), macValue.begin(), macValue.end());
-
-    // DEBUG: log MAC input (AL fragment) and computed MAC
-    // {
-    //     std::ostringstream d;
-    //     d << "Key Status Confirmation: KSQ=" << ksq << ", User=" << userNum
-    //       << ", Status=OK, MAL=0x03 (HMAC-SHA256-8)"
-    //       << ", MAC=" << macValue.size() << " bytes";
-    //     Log("INFO", d.str());
-    // }
-    // {
-    //     std::ostringstream d;
-    //     d << "DEBUG MAC key (MDK first 16B): ";
-    //     for (int i = 0; i < 16; ++i)
-    //         d << std::hex << std::setw(2) << std::setfill('0')
-    //           << (int)monitorKey[i] << (i < 15 ? ":" : "");
-    //     Log("INFO", d.str());
-    // }
-    // {
-    //     std::ostringstream d;
-    //     d << "DEBUG MAC input = AL fragment of g120v6 (" << lastKeyChangeAlFragment_.size() << " bytes): ";
-    //     for (size_t i = 0; i < lastKeyChangeAlFragment_.size(); ++i)
-    //         d << std::hex << std::setw(2) << std::setfill('0')
-    //           << (int)lastKeyChangeAlFragment_[i]
-    //           << (i + 1 < lastKeyChangeAlFragment_.size() ? ":" : "");
-    //     Log("INFO", d.str());
-    // }
-    // {
-    //     std::ostringstream d;
-    //     d << "DEBUG MAC output: ";
-    //     for (size_t i = 0; i < macValue.size(); ++i)
-    //         d << std::hex << std::setw(2) << std::setfill('0')
-    //           << (int)macValue[i] << (i + 1 < macValue.size() ? ":" : "");
-    //     Log("INFO", d.str());
-    // }
 
     return result;
 }

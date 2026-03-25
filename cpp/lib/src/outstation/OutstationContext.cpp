@@ -238,7 +238,7 @@ bool OContext::OnLowerLayerDown()
         {
             if (saKeyManager->GetKeyStatus(user) == KeyStatus::OK)
             {
-                saKeyManager->InvalidateKeys(user, KeyStatus::COMM_FAIL);
+                saKeyManager->InvalidateKeys(user, KeyStatus::NOT_INIT);
             }
         }
 
@@ -246,6 +246,7 @@ bool OContext::OnLowerLayerDown()
         pendingChallengeAPDU.clear();
         pendingCriticalUserNum = 0;
         sessionControlKeys.clear();
+        sessionMonitorKeys.clear();
 
         SIMPLE_LOG_BLOCK(this->logger, flags::WARN, "SAv5 session keys invalidated due to link down");
     }
@@ -815,7 +816,7 @@ OutstationState& OContext::OnReceiveSolRequest(const ParsedRequest& request)
         && !executingAuthenticatedAPDU
     ) {
         // Check if session keys are valid for this user
-        // TODO: Extract user number from request authentication object
+        // TODO: Extract user number from request authentication object for multiuser functionality
         uint16_t userNum = 1; // Default user for now
 
         KeyStatus keyStatus = saKeyManager->GetKeyStatus(userNum);
