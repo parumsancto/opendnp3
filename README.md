@@ -19,6 +19,91 @@ You can read about this decision in these blog posts:
 * [OpenDNP3 Retrospective](https://stepfunc.io/blog/opendnp3-retrospective/)
 * [DNP3 1.0.0 (Rust)](https://stepfunc.io/blog/dnp3_1_0_0/)
 
+---
+> **⚠️ This is a fork.** The upstream project reached end-of-life in 2022.
+> This fork extends the library with **SAv5 (Secure Authentication v5)** support
+> for the outstation role, targeting embedded Linux platforms (BeagleBone Black + Comms Cape).
+
+SAv5 Outstation Support (this fork)
+========
+
+This fork adds a complete implementation of **DNP3 Secure Authentication Version 5**
+([IEEE 1815-2012](https://github.com/parumsancto/opendnp3/blob/release/DNP3-IEEE-Standard.pdf), Section 7) for the outstation role. The implementation is
+self-contained and does not break backward compatibility — SA is disabled by default
+and activated via `OutstationParams`.
+
+### Architecture
+
+The SA subsystem consists of four new modules:
+
+| Module | File | Responsibility |
+|---|---|---|
+| `SAKeyManager` | `SAKeyManager.h/.cpp` | Key Status (g120v5), Key Change (g120v6), AES Key Unwrap (RFC 3394), HMAC-SHA256 confirmation |
+| `SAChallenger` | `SAChallenger.h/.cpp` | Generates g120v1 Challenge, validates g120v2 Reply MAC |
+| `SAResponder` | `SAResponder.h/.cpp` | Stores session keys (CDK/MDK) per user, computes HMAC for authenticated responses |
+| `Group120Parser` / `Group120Builder` | `Group120Parser.h/.cpp`, `Group120Builder.h/.cpp` | Serializes/deserializes Group 120 Variations 1–6 |
+
+`OutstationContext` intercepts critical function codes and initiates the
+challenge-response exchange before execution per [IEEE 1815-2012](https://github.com/parumsancto/opendnp3/blob/release/DNP3-IEEE-Standard.pdf) Table 7-1.
+
+### Configuration
+
+```cpp
+config.outstation.params.saEnabled = true;
+
+// AES-128 Update Key (16 active bytes, pad remaining with zeros):
+config.outstation.params.saUpdateKey = {
+    0x4D, 0x56, 0x4B, 0xEA, 0x57, 0x15, 0xDD, 0x96,
+    0x59, 0xEF, 0x99, 0xA8, 0x95, 0xBB, 0x83, 0x0A,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+};
+
+// AES-256 Update Key (all 32 bytes active — auto-detected):
+config.outstation.params.saUpdateKey = {
+    0x4D, 0x56, 0x4B, 0xEA, 0x57, 0x15, 0xDD, 0x96,
+    0x59, 0xEF, 0x99, 0xA8, 0x95, 0xBB, 0x83, 0x0A,
+    0x4D, 0x56, 0x4B, 0xEA, 0x57, 0x15, 0xDD, 0x96,
+    0x59, 0xEF, 0x99, 0xA8, 0x95, 0xBB, 0x83, 0x0A,
+};
+```
+
+The Key Wrap Algorithm (AES-128 / AES-256) is **auto-detected** from the Update Key:
+if any byte in positions `[16..31]` is non-zero, AES-256 is used automatically.
+
+### Tested Interoperability
+
+Tested against **zenon SCADA** by [COPA-DATA](https://www.copadata.com/) acting as DNP3 master.  
+Target hardware: **BeagleBone Black** with **Comms Cape** (Debian 12).
+
+**MAC Algorithms**
+
+| Algorithm | Status |
+|---|---|
+| HMAC-SHA-1 truncated to 10 bytes | ✅ Tested |
+| HMAC-SHA-1 truncated to 8 bytes | ✅ Tested |
+| HMAC-SHA-256 truncated to 8 bytes | ✅ Tested |
+| HMAC-SHA-256 truncated to 16 bytes | ✅ Tested |
+| AES-GMAC | ⚪ Not testable (not supported by zenon) |
+
+**Key Wrap Algorithms**
+
+| Algorithm  | Status |
+|---|---|
+| AES-128 Key Wrap (RFC 3394) | ✅ Tested |
+| AES-256 Key Wrap (RFC 3394) | ✅ Tested |
+
+**Modes**
+
+| Feature | Status |
+|---|---|
+| Pre-challenge (normal) mode | ✅ Supported |
+| Aggressive mode | ❌ Not implemented |
+
+### Dependencies
+
+SA support requires **OpenSSL** (≥ 1.1.0) linked at build time (`libssl`, `libcrypto`).  
+CMakeLists already includes OpenSSL detection for both Linux and Windows targets.
 
 Overview
 ========
@@ -41,7 +126,7 @@ Documentation
 
 The documentation can be found on the [project homepage](http://dnp3.github.io/#documentation).
 
-If you want to help contribute to the official guide its in [this repo](https://github.com/dnp3/opendnp3-guide).
+If you want to help contribute to the official guide its in [this repo](https://github.com/dnp3/opendnp3-guide).			
 
 License
 =============

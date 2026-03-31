@@ -1,3 +1,6 @@
+### 3.3.0 ###
+SAv5 (Secure Authentication v5, IEEE 1815-2012) integration for outstation.
+
 ### 3.1.2 ###
 * :beetle: Fix `PrintingSOEHandler` octet string size not printing properly.
   See [4372862](https://github.com/dnp3/opendnp3/commit/4372862728851f559a01edcd88bc15ce6ce7f350)
