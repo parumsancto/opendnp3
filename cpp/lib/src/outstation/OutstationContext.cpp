@@ -646,7 +646,8 @@ bool OContext::OnReceiveSAMessage(const ParsedRequest& request)
                 macValue,
                 pendingChallengeAPDU,  // complete AL fragment of g120v1 sent to master
                 pendingCriticalAPDU,   // complete AL fragment of WRITE request
-                controlKey
+                controlKey,
+                static_cast<int>(saKeyManager->GetSessionKeyLen())
             );
 
             if (valid)

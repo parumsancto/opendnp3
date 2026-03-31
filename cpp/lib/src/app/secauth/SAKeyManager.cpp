@@ -20,12 +20,22 @@ struct SAKeyManager::OpenSSLContext
 };
 
 SAKeyManager::SAKeyManager(const std::array<uint8_t, 32>& updateKey)
-    : updateKey_(updateKey),
+    : updateKey(updateKey),
       ksq(0),
       keyWrapAlgo(KeyWrapAlgorithm::AES128),
       lastUserNum(0),
       sslCtx_(new OpenSSLContext())
 {
+    // Auto-detect AES-256: if any byte in the upper 16 bytes is non-zero,
+    // the full 32-byte key is in use -> switch to AES-256 Key Wrap (RFC 3394).
+    for (size_t i = 16; i < 32; ++i)
+    {
+        if (updateKey[i] != 0)
+        {
+            keyWrapAlgo = KeyWrapAlgorithm::AES256;
+            break;
+        }
+    }
 }
 
 SAKeyManager::~SAKeyManager()
@@ -81,44 +91,61 @@ std::vector<uint8_t> SAKeyManager::GenerateRandomChallengeData()
     return challengeData;
 }
 
-
 std::vector<uint8_t> SAKeyManager::OnKeyStatusRequest(uint16_t userNum)
 {
-    // IEEE 1815-2012 Section 7.5.5.2 (Step 1 of Figure 7-3)
-    
-    // Step 1: Increment KSQ
+    // Step 1: Increment KSQ, generate new challenge data
     ++ksq;
-
-    // Step 2: Generate random challenge data (16 bytes)
     lastChallengeData = GenerateRandomChallengeData();
     lastUserNum = userNum;
 
-    // Step 3: Get current key status
     KeyStatus status = GetKeyStatus(userNum);
 
-    // Step 4: Build g120v5 Key Status
-    Group120Var5 keyStatus;
-    keyStatus.ksq = ksq;
-    keyStatus.userNumber = userNum;
-    keyStatus.keyWrapAlgo = static_cast<uint8_t>(keyWrapAlgo);
-    keyStatus.status = static_cast<uint8_t>(status);
-    keyStatus.macAlgorithm = 0;  // 0 = No MAC Value
+    // Per IEEE 1815-2012 Table 7-4: when Key Status != OK, MAC Value is absent.
+    // objSize = KSQ(4) + USR(2) + KWA(1) + Status(1) + MAL(1) + CDL(2) + CD(N)
+    // No MAC bytes — MAL=0x00 signals "no MAC".
+    const uint16_t cdl     = static_cast<uint16_t>(lastChallengeData.size());
+    const uint16_t objSize = static_cast<uint16_t>(4 + 2 + 1 + 1 + 1 + 2 + cdl);
 
-    std::vector<uint8_t> keyStatusBytes = Group120Builder::BuildKeyStatus(
-        keyStatus, lastChallengeData);
+    std::vector<uint8_t> result;
+    result.reserve(6 + objSize);
 
-    // The initial Key Status response (before Key Change) has no MAC (MAL field
-    // indicates what algorithm WILL BE used in the confirmation).
-    keyStatusBytes.push_back(static_cast<uint8_t>(MACAlgorithm::HMAC_SHA1_TRUNC_10));
+    // DNP3 object header: Group(1) + Var(1) + Qualifier(1) + Count(1) + ObjSize(2)
+    result.push_back(0x78); // Group 120
+    result.push_back(0x05); // Variation 5
+    result.push_back(0x5B); // Qualifier: 16-bit free-format
+    result.push_back(0x01); // Count = 1
+    result.push_back( objSize & 0xFF);
+    result.push_back((objSize >> 8) & 0xFF);
+
+    auto appendU32LE = [&](uint32_t v) {
+        result.push_back( v        & 0xFF);
+        result.push_back((v >>  8) & 0xFF);
+        result.push_back((v >> 16) & 0xFF);
+        result.push_back((v >> 24) & 0xFF);
+    };
+    auto appendU16LE = [&](uint16_t v) {
+        result.push_back( v       & 0xFF);
+        result.push_back((v >> 8) & 0xFF);
+    };
+
+    appendU32LE(ksq);
+    appendU16LE(userNum);
+    result.push_back(static_cast<uint8_t>(keyWrapAlgo)); // KWA: 0x01=AES-128, 0x02=AES-256
+    result.push_back(static_cast<uint8_t>(status));       // Key Status (NOT_INIT/COMM_FAIL)
+    result.push_back(0x00);                               // MAL = 0x00 (no MAC value follows)
+    appendU16LE(cdl);
+    result.insert(result.end(),
+                  lastChallengeData.begin(),
+                  lastChallengeData.end());
 
     std::ostringstream oss;
-    oss << "Key Status Request: KSQ=" << ksq 
+    oss << "Key Status Request: KSQ=" << ksq
         << ", User=" << userNum
         << ", Status=" << static_cast<int>(status)
         << ", Algo=" << static_cast<int>(keyWrapAlgo);
     Log("INFO", oss.str());
 
-    return keyStatusBytes;
+    return result;
 }
 
 std::vector<uint8_t> SAKeyManager::OnKeyStatusRequestWithMAC(
@@ -154,7 +181,7 @@ std::vector<uint8_t> SAKeyManager::OnKeyStatusRequestWithMAC(
     // Step 3: HMAC-SHA-256 truncated to 8 bytes
     unsigned char digest[EVP_MAX_MD_SIZE];
     unsigned int digestLen = 0;
-    HMAC(EVP_sha256(), monitorKey.data(), 16,
+    HMAC(EVP_sha256(), monitorKey.data(), sessionKeyLen,
          macInput.data(), macInput.size(), digest, &digestLen);
     constexpr size_t MACTRUNCLEN = 8;
     std::vector<uint8_t> macValue(digest, digest + std::min((size_t)digestLen, MACTRUNCLEN));
@@ -226,7 +253,7 @@ std::vector<uint8_t> SAKeyManager::AESKeyUnwrap(const std::vector<uint8_t>& wrap
     AES_KEY aesKey;
     int keyBits = (keyWrapAlgo == KeyWrapAlgorithm::AES256) ? 256 : 128;
 
-    if (AES_set_decrypt_key(updateKey_.data(), keyBits, &aesKey) != 0)
+    if (AES_set_decrypt_key(updateKey.data(), keyBits, &aesKey) != 0)
     {
         Log("ERROR", "AES_set_decrypt_key failed");
         return {};
@@ -294,53 +321,64 @@ bool SAKeyManager::OnKeyChange(const Group120Var6& keyChange,
 
     // IEEE 1815-2012 Table A-4: save the entire AL fragment of the Key Change
     // message for use in BuildKeyStatusConfirmation MAC calculation.
-    lastKeyChangeAlFragment_ = keyChangeAlFragment;
+    lastKeyChangeAlFragment = keyChangeAlFragment;
 
+    // Read Key Length field (bytes 0-1 LE) to compute field offsets dynamically.
+    // IEEE 1815-2012 Table A-5 structure:
+    //   KL(2) + CDK(KL) + MDK(KL) + KSQ(4) + USR(2) + KWA(1) + Status(1) + MAL(1) + CDL(2) + CD_OS(CDL)
+    // Standard says KL=16 always, but opendnp3 master uses KL=32 when KWA=AES-256.
+    if (unwrapped.size() < 2)
+    {
+        Log("ERROR", "Unwrapped data too short to read KL field");
+        InvalidateKeys(keyChange.userNumber, KeyStatus::AUTH_FAIL);
+        return false;
+    }
 
-    // IEEE 1815-2012 Annex A, Table A-5 — plaintext у key wrap (AES-128, CD=16B):
-    // [0:1]   = Key Length (uint16 LE) = 0x0010
-    // [2:17]  = CDK  — Control Direction Session Key
-    // [18:33] = MDK  — Monitoring Direction Session Key
-    // [34:37] = KSQ  (4 байти LE)
-    // [38:39] = USR  (2 байти LE)
-    // [40]    = KWA
-    // [41]    = Key Status
-    // [42]    = MAL
-    // [43:44] = CDL  (2 байти LE)
-    // [45:60] = CD_OS — Challenge Data з нашого g120v5
-    // [61:63] = Padding (3 байти)
-    // MAC у plaintext ВІДСУТНІЙ — цілісність гарантує AES Key Wrap IV (RFC 3394)
-    constexpr size_t KEY_LEN_OFFSET = 0;
-    constexpr size_t CDK_OFFSET     = 2;
-    constexpr size_t MDK_OFFSET     = 18;
-    constexpr size_t CD_OS_OFFSET   = 45;
+    const uint16_t kl = static_cast<uint16_t>(unwrapped[0]) |
+                        (static_cast<uint16_t>(unwrapped[1]) << 8);
 
-    const size_t cdLen = lastChallengeData.size(); // = 32
-    const size_t minRequired = CD_OS_OFFSET + cdLen; // = 77
-
-    if (unwrapped.size() < minRequired)
+    if (kl != 16 && kl != 32)
     {
         std::ostringstream oss;
-        oss << "Unwrapped key too small: " << unwrapped.size()
-            << ", need " << minRequired;
+        oss << "Unexpected KL in key wrap plaintext: " << kl;
+        Log("WARN", oss.str());
+    }
+
+    // Dynamic offsets based on actual KL value
+    const size_t cdkOffset  = 2;
+    const size_t mdkOffset  = 2 + static_cast<size_t>(kl);
+    const size_t cdlOffset  = 2 + 2 * static_cast<size_t>(kl) + 9; // KSQ(4)+USR(2)+KWA(1)+Stat(1)+MAL(1)
+    const size_t cdOsOffset = cdlOffset + 2;
+
+    if (unwrapped.size() < cdlOffset + 2)
+    {
+        std::ostringstream oss;
+        oss << "Unwrapped data too short for CDL field (need "
+            << (cdlOffset + 2) << ", have " << unwrapped.size() << ")";
         Log("ERROR", oss.str());
         InvalidateKeys(keyChange.userNumber, KeyStatus::AUTH_FAIL);
         return false;
     }
 
-    // Перевірка Key Length field
-    uint16_t keyLen = static_cast<uint16_t>(unwrapped[KEY_LEN_OFFSET]) |
-                      (static_cast<uint16_t>(unwrapped[KEY_LEN_OFFSET + 1]) << 8);
-    if (keyLen != 16)
+    // Read CDL from plaintext (not from lastChallengeData.size())
+    const uint16_t cdl = static_cast<uint16_t>(unwrapped[cdlOffset]) |
+                         (static_cast<uint16_t>(unwrapped[cdlOffset + 1]) << 8);
+
+    if (unwrapped.size() < cdOsOffset + static_cast<size_t>(cdl))
     {
         std::ostringstream oss;
-        oss << "Unexpected key length in wrapped data: " << keyLen;
-        Log("WARN", oss.str());
+        oss << "Unwrapped data too short for CD_OS (need "
+            << (cdOsOffset + cdl) << ", have " << unwrapped.size() << ")";
+        Log("ERROR", oss.str());
+        InvalidateKeys(keyChange.userNumber, KeyStatus::AUTH_FAIL);
+        return false;
     }
 
-    // Перевірка CD_OS — має збігатися з Challenge Data, що ми відправили в g120v5
-    const uint8_t* cdOsPtr = unwrapped.data() + CD_OS_OFFSET;
-    if (std::memcmp(cdOsPtr, lastChallengeData.data(), cdLen) != 0)
+    // Verify CD_OS matches the challenge data we sent in g120v5
+    if (static_cast<size_t>(cdl) != lastChallengeData.size() ||
+        std::memcmp(unwrapped.data() + cdOsOffset,
+                    lastChallengeData.data(),
+                    lastChallengeData.size()) != 0)
     {
         Log("ERROR", "CD_OS mismatch: key change rejected");
         InvalidateKeys(keyChange.userNumber, KeyStatus::AUTH_FAIL);
@@ -348,18 +386,23 @@ bool SAKeyManager::OnKeyChange(const Group120Var6& keyChange,
     }
     Log("INFO", "CD_OS verification successful");
 
-    // Витягуємо сесійні ключі з правильних зміщень
+    // Extract session keys; copy min(kl, 32) bytes into 32-byte slots
+    const size_t copyLen = std::min(static_cast<size_t>(kl), size_t(32));
     controlKeyOut.fill(0);
     monitorKeyOut.fill(0);
-    std::memcpy(controlKeyOut.data(), unwrapped.data() + CDK_OFFSET, 16); // CDK
-    std::memcpy(monitorKeyOut.data(), unwrapped.data() + MDK_OFFSET, 16); // MDK
+    std::memcpy(controlKeyOut.data(), unwrapped.data() + cdkOffset, copyLen);
+    std::memcpy(monitorKeyOut.data(), unwrapped.data() + mdkOffset, copyLen);
+
+    // Save actual session key length for use in HMAC calculations
+    sessionKeyLen = static_cast<uint16_t>(copyLen);
 
     userNumOut = keyChange.userNumber;
-    keyStatusMap_[keyChange.userNumber] = KeyStatus::OK;
+    keyStatusMap[keyChange.userNumber] = KeyStatus::OK;
 
     std::ostringstream oss;
     oss << "Key Change successful: User=" << keyChange.userNumber
-        << ", KSQ=" << keyChange.ksq;
+        << ", KSQ=" << keyChange.ksq
+        << ", KL=" << kl;
     Log("INFO", oss.str());
     return true;
 }
@@ -372,14 +415,14 @@ std::vector<uint8_t> SAKeyManager::BuildKeyStatusConfirmation(
     // Per IEEE 1815-2012 Table A-4:
     // MAC input = the entire Application Layer fragment of the g120v6 Key Change
     // most recently received from the master. NOT the fields of this g120v5 object.
-    if (lastKeyChangeAlFragment_.empty())
+    if (lastKeyChangeAlFragment.empty())
     {
         Log("ERROR", "BuildKeyStatusConfirmation: no Key Change AL fragment stored");
         return {};
     }
 
     // Wire-level constants per IEEE 1815-2012 Table 7-4 and Table 7-5
-    constexpr uint8_t KWA_AES128_WIRE     = 0x01;
+    // constexpr uint8_t KWA_AES128_WIRE     = 0x01;
     constexpr uint8_t STATUS_OK_WIRE      = 0x01;
     constexpr uint8_t MAL_SHA256_8_WIRE   = 0x03;  // HMAC-SHA256 truncated to 8 octets
     constexpr size_t  MAC_TRUNC_LEN       = 8;
@@ -388,8 +431,8 @@ std::vector<uint8_t> SAKeyManager::BuildKeyStatusConfirmation(
     unsigned char digest[EVP_MAX_MD_SIZE];
     unsigned int  digestLen = 0;
     HMAC(EVP_sha256(),
-         monitorKey.data(), 16,
-         lastKeyChangeAlFragment_.data(), lastKeyChangeAlFragment_.size(),
+         monitorKey.data(), sessionKeyLen,
+         lastKeyChangeAlFragment.data(), lastKeyChangeAlFragment.size(),
          digest, &digestLen);
 
     std::vector<uint8_t> macValue(digest, digest + std::min((size_t)digestLen, MAC_TRUNC_LEN));
@@ -416,7 +459,8 @@ std::vector<uint8_t> SAKeyManager::BuildKeyStatusConfirmation(
     // USR (2 bytes LE)
     result.push_back( userNum       & 0xFF);
     result.push_back((userNum >> 8) & 0xFF);
-    result.push_back(KWA_AES128_WIRE);
+    // result.push_back(KWA_AES128_WIRE);
+    result.push_back(static_cast<uint8_t>(keyWrapAlgo));
     result.push_back(STATUS_OK_WIRE);
     result.push_back(MAL_SHA256_8_WIRE);
     result.push_back( cdl       & 0xFF);
@@ -434,8 +478,8 @@ uint32_t SAKeyManager::GetKSQ() const
 
 KeyStatus SAKeyManager::GetKeyStatus(uint16_t userNum) const
 {
-    auto it = keyStatusMap_.find(userNum);
-    if (it != keyStatusMap_.end())
+    auto it = keyStatusMap.find(userNum);
+    if (it != keyStatusMap.end())
     {
         return it->second;
     }
@@ -446,7 +490,7 @@ KeyStatus SAKeyManager::GetKeyStatus(uint16_t userNum) const
 
 void SAKeyManager::InvalidateKeys(uint16_t userNum, KeyStatus status)
 {
-    keyStatusMap_[userNum] = status;
+    keyStatusMap[userNum] = status;
 
     std::ostringstream oss;
     oss << "Keys invalidated for user " << userNum 

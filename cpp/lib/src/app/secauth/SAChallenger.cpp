@@ -67,7 +67,8 @@ bool SAChallenger::ValidateReply(
     const std::vector<uint8_t>& receivedMAC,
     const std::vector<uint8_t>& challengeAPDU,
     const std::vector<uint8_t>& challengedAPDU,
-    const std::array<uint8_t, 32>& controlKey
+    const std::array<uint8_t, 32>& controlKey,
+    int keyLen
 ) {
     if (!hasPendingChallenge_)
     {
@@ -100,7 +101,7 @@ bool SAChallenger::ValidateReply(
     macInput.insert(macInput.end(), challengeAPDU.begin(),  challengeAPDU.end());
     macInput.insert(macInput.end(), challengedAPDU.begin(), challengedAPDU.end());
 
-    std::vector<uint8_t> expected = ComputeHMAC(currentAlgo_, controlKey, macInput);
+    std::vector<uint8_t> expected = ComputeHMAC(currentAlgo_, controlKey, macInput, keyLen);
 
     if (expected.empty())
     {
@@ -122,10 +123,12 @@ bool SAChallenger::ValidateReply(
     return valid;
 }
 
-std::vector<uint8_t> SAChallenger::ComputeHMAC(MACAlgorithm algo,
-                                                 const std::array<uint8_t, 32>& key,
-                                                 const std::vector<uint8_t>& data)
-{
+std::vector<uint8_t> SAChallenger::ComputeHMAC(
+    MACAlgorithm algo,
+    const std::array<uint8_t, 32>& key,
+    const std::vector<uint8_t>& data,
+    int keyLen
+) {
     unsigned char digest[EVP_MAX_MD_SIZE];
     unsigned int digestLen = 0;
 
@@ -133,17 +136,17 @@ std::vector<uint8_t> SAChallenger::ComputeHMAC(MACAlgorithm algo,
     {
     case MACAlgorithm::HMAC_SHA256_TRUNC_8:
         // key.data(), 16 — use only first 16 bytes for AES-128 session key
-        HMAC(EVP_sha256(), key.data(), 16, data.data(), data.size(), digest, &digestLen);
+        HMAC(EVP_sha256(), key.data(), keyLen, data.data(), data.size(), digest, &digestLen);
         if (digestLen >= 8) return std::vector<uint8_t>(digest, digest + 8);
         break;
 
     case MACAlgorithm::HMAC_SHA256_TRUNC_16:
-        HMAC(EVP_sha256(), key.data(), 16, data.data(), data.size(), digest, &digestLen);
+        HMAC(EVP_sha256(), key.data(), keyLen, data.data(), data.size(), digest, &digestLen);
         if (digestLen >= 16) return std::vector<uint8_t>(digest, digest + 16);
         break;
 
     case MACAlgorithm::HMAC_SHA1_TRUNC_10:
-        HMAC(EVP_sha1(), key.data(), 16, data.data(), data.size(), digest, &digestLen);
+        HMAC(EVP_sha1(), key.data(), keyLen, data.data(), data.size(), digest, &digestLen);
         if (digestLen >= 10) return std::vector<uint8_t>(digest, digest + 10);
         break;
 

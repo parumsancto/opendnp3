@@ -34,7 +34,8 @@ public:
         const std::vector<uint8_t>& receivedMAC,
         const std::vector<uint8_t>& challengeAPDU,   // full AL fragment of g120v1
         const std::vector<uint8_t>& challengedAPDU,  // full AL fragment of WRITE req
-        const std::array<uint8_t, 32>& controlKey
+        const std::array<uint8_t, 32>& controlKey,
+        int keyLen = 16
     );
 
     void Reset();
@@ -43,8 +44,9 @@ private:
     void Log(const char* severity, const std::string& msg);
 
     std::vector<uint8_t> ComputeHMAC(MACAlgorithm algo,
-                                      const std::array<uint8_t, 32>& key,
-                                      const std::vector<uint8_t>& data);
+        const std::array<uint8_t, 32>& key,
+        const std::vector<uint8_t>& data,
+        int keyLen = 16);
 
     LogCallback logCallback_;
     uint32_t currentCSQ_     = 0;

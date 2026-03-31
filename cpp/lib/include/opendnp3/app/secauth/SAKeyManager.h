@@ -55,6 +55,7 @@ public:
     // OUTSTATION SIDE - Session Key Change Protocol
     // ========================================================================
 
+    uint16_t GetSessionKeyLen() const { return sessionKeyLen; }
     /**
      * @brief Handle g120v4 Key Status Request from master
      * @details IEEE 1815-2012 Section 7.5.5.2 (Step 1 of Figure 7-3)
@@ -148,7 +149,8 @@ public:
 
 private:
     /// Update Key (32 bytes, AES-256 key wrap key)
-    std::array<uint8_t, 32> updateKey_;
+    std::array<uint8_t, 32> updateKey;
+    uint16_t sessionKeyLen = 16;
 
     /// Key Change Sequence Number (increments on each key status request)
     /// IEEE 1815-2012 Section 7.5.5.3.3
@@ -158,7 +160,7 @@ private:
     KeyWrapAlgorithm keyWrapAlgo;
 
     /// Per-user key status (OK, NOT_INIT, COMM_FAIL, AUTH_FAIL)
-    std::map<uint16_t, KeyStatus> keyStatusMap_;
+    std::map<uint16_t, KeyStatus> keyStatusMap;
 
     /// Last generated challenge data (16 bytes, stored for verification)
     std::vector<uint8_t> lastChallengeData;
@@ -202,7 +204,7 @@ private:
     OpenSSLContext* sslCtx_;
     // Stores the entire AL fragment of the most recently received g120v6 Key Change.
     // Used as MAC input for the Key Status Confirmation per IEEE 1815-2012 Table A-4.
-    std::vector<uint8_t> lastKeyChangeAlFragment_;
+    std::vector<uint8_t> lastKeyChangeAlFragment;
 };
 
 } // namespace opendnp3
