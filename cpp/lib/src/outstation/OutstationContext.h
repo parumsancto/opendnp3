@@ -50,6 +50,7 @@
 #include "opendnp3/app/secauth/SAResponder.h"
 #include "opendnp3/app/secauth/SAChallenger.h"
 #include "opendnp3/app/secauth/SAKeyManager.h"
+#include "opendnp3/app/secauth/SAMode.h"
 
 #include <functional>
 #include <memory>
@@ -300,7 +301,7 @@ private:
     // SAv5 INTEGRATION: Secure Authentication state
     // ============================================================
 
-    /// @brief SAv5 components (initialized if saEnabled = true)
+    /// @brief SAv5 components (initialized if saMode != SAMode::NONE)
     std::unique_ptr<SAResponder> saResponder;
     std::unique_ptr<SAChallenger> saChallenger;
     std::unique_ptr<SAKeyManager> saKeyManager;
@@ -311,8 +312,8 @@ private:
     static constexpr size_t SA_TX_BUFFER_SIZE = 2048;
     std::array<uint8_t, SA_TX_BUFFER_SIZE> saTxBuffer_;
 
-    /// @brief Is Secure Authentication enabled?
-    bool saEnabled;
+    /// @brief Secure Authentication mode
+    SAMode saMode;
 
     /// @brief Pending critical APDU awaiting authentication
     /// @details Stores serialized APDU bytes to execute after successful auth

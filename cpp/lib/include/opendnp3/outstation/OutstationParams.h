@@ -25,6 +25,7 @@
 #include "opendnp3/outstation/NumRetries.h"
 #include "opendnp3/outstation/StaticTypeBitfield.h"
 #include "opendnp3/util/TimeDuration.h"
+#include "opendnp3/app/secauth/SAMode.h"
 
 namespace opendnp3
 {
@@ -75,11 +76,10 @@ struct OutstationParams
     bool respondToAnyMaster = false;
 
     /**
-     * @brief Enable Secure Authentication v5
-     * @details Set to true to activate SAv5 protocol
-     * Requires saUpdateKey to be configured
+     * @brief Configure Secure Authentication
+     * Requires saUpdateKey if saMode != SAMode::NONE
      */
-    bool saEnabled = false;
+    SAMode saMode = SAMode::NONE;
 
     /**
      * @brief Update Key for Session Key encryption
@@ -95,7 +95,7 @@ struct OutstationParams
      * std::array<uint8_t, 32> updateKey;
      * // Load from secure storage
      * config.outstation.params.saUpdateKey = updateKey;
-     * config.outstation.params.saEnabled = true;
+     * config.outstation.params.saMode = SAMode::SAV5;
      * ```
      */
     std::array<uint8_t, 32> saUpdateKey = {}; // All zeros = SA disabled

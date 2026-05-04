@@ -29,6 +29,7 @@ set(opendnp3_public_headers
 
     ./include/opendnp3/app/parsing/ICollection.h
 
+    ./include/opendnp3/app/secauth/SAMode.h
     ./include/opendnp3/app/secauth/Group120Parser.h
     ./include/opendnp3/app/secauth/Group120Builder.h
     ./include/opendnp3/app/secauth/SAResponder.h

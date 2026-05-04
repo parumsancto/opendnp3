@@ -162,3 +162,5 @@ cpp/demos/cover_html/
 
 # VS Code
 .vscode/
+
+*.pdf

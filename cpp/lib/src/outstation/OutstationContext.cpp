@@ -77,11 +77,11 @@ OContext::OContext(const Addresses& addresses,
       // ============================================================
       // SAv5 INTEGRATION: Initialize SA components if enabled
       // ============================================================
-      saEnabled(config.params.saEnabled),
+      saMode(config.params.saMode),
       pendingCriticalUserNum(0)
 {
     // Initialize Secure Authentication components if enabled
-    if (saEnabled)
+    if (saMode != SAMode::NONE)
     {
         // Check if Update Key is configured (non-zero)
         bool hasUpdateKey = false;
@@ -164,7 +164,7 @@ OContext::OContext(const Addresses& addresses,
         {
             SIMPLE_LOG_BLOCK(this->logger, flags::WARN,
                              "SAv5 enabled but saUpdateKey is all zeros - SA will not function");
-            saEnabled = false;
+            saMode = SAMode::NONE;
         }
     }
 }
@@ -188,7 +188,7 @@ bool OContext::OnLowerLayerUp()
     // ============================================================
     // SAv5 INTEGRATION: Reset SA state on link up
     // ============================================================
-    if (saEnabled && saKeyManager)
+    if (saMode != SAMode::NONE && saKeyManager)
     {
         // Clear pending critical APDU
         pendingCriticalAPDU.clear();
@@ -196,7 +196,7 @@ bool OContext::OnLowerLayerUp()
         pendingCriticalUserNum = 0;
 
         // Reset exchange flag on each new connection.
-        saKeyExchangeInProgress = saEnabled;
+        saKeyExchangeInProgress = (saMode != SAMode::NONE);
 
         SIMPLE_LOG_BLOCK(this->logger, flags::INFO, "SAv5 state reset on link up");
     }
@@ -229,7 +229,7 @@ bool OContext::OnLowerLayerDown()
     // ============================================================
     // SAv5 INTEGRATION: Invalidate keys on link down
     // ============================================================
-    if (saEnabled && saKeyManager)
+    if (saMode != SAMode::NONE && saKeyManager)
     {
         // Invalidate all session keys (communication failure)
         // Iterate through potential user numbers (typically 1-65535)
@@ -282,7 +282,7 @@ bool OContext::OnReceive(const Message& message)
     // the master has verified the confirmation MAC. Calling CheckForTaskStart
     // at that point triggers unsolicited transmission, which causes the master
     // to abort the Key Change (IEEE 1815-2012 Table 7-13 event 9).
-    if (!saEnabled || !saKeyExchangeInProgress)
+    if (saMode == SAMode::NONE || !saKeyExchangeInProgress)
     {
         this->CheckForTaskStart();
     }
@@ -322,7 +322,7 @@ bool OContext::IsCriticalFunction(FunctionCode fc) const
 
 bool OContext::InitiateChallengeForCriticalFunction(const ParsedRequest& request)
 {
-    if (!saEnabled || !saChallenger || !saResponder)
+    if (saMode == SAMode::NONE || !saChallenger || !saResponder)
     {
         SIMPLE_LOG_BLOCK(this->logger, flags::WARN, "Cannot initiate challenge - SA not enabled");
         return false;
@@ -525,7 +525,7 @@ void OContext::ExecutePendingCriticalAPDU()
 // ============================================================
 bool OContext::OnReceiveSAMessage(const ParsedRequest& request)
 {
-    if (!saEnabled || !saKeyManager || !saChallenger || !saResponder)
+    if (saMode == SAMode::NONE || !saKeyManager || !saChallenger || !saResponder)
     {
         SIMPLE_LOG_BLOCK(this->logger, flags::WARN, "Received AUTH_REQUEST but SA not enabled");
         return false;
@@ -811,7 +811,7 @@ OutstationState& OContext::OnReceiveSolRequest(const ParsedRequest& request)
     // SAv5 INTEGRATION: Intercept critical functions for auth
     // ============================================================
 
-    if (saEnabled
+    if (saMode != SAMode::NONE
         && saKeyManager
         && IsCriticalFunction(request.header.function)
         && !executingAuthenticatedAPDU
@@ -888,7 +888,7 @@ OutstationState& OContext::ProcessNewRequest(const ParsedRequest& request)
 
     // If we receive a normal solicited request after Key Exchange, master has accepted
     // the session keys. Re-enable unsolicited and clear the exchange flag.
-    if (saEnabled && saKeyExchangeInProgress)
+    if (saMode != SAMode::NONE && saKeyExchangeInProgress)
     {
         saKeyExchangeInProgress = false;
         this->shouldCheckForUnsolicited = true;
@@ -936,7 +936,7 @@ bool OContext::ProcessObjects(const ParsedRequest& request)
     // Two BeginTx calls in a row cause "Invalid BeginTransmit call, already transmitting".
     if (request.header.function == FunctionCode::AUTH_REQUEST)
     {
-        if (saEnabled)
+        if (saMode != SAMode::NONE)
             return this->OnReceiveSAMessage(request);
         // SA disabled - use application callback
         this->application->OnAuthRequest(request.objects, request.objects.length());
@@ -945,7 +945,7 @@ bool OContext::ProcessObjects(const ParsedRequest& request)
 
     if (request.header.function == FunctionCode::AUTH_REQUEST_NO_ACK)
     {
-        if (saEnabled)
+        if (saMode != SAMode::NONE)
             this->OnReceiveSAMessage(request);
         else
             this->application->OnAuthRequestNoAck(request.objects, request.objects.length());
@@ -1032,7 +1032,7 @@ void OContext::CheckForTaskStart()
     // OnTxReady() calls CheckForTaskStart() unconditionally (even when
     // saKeyExchangeInProgress=true), so we must guard CheckForUnsolicitedNull
     // explicitly here — shouldCheckForUnsolicited alone is not enough.
-    if (!saEnabled || !saKeyExchangeInProgress)
+    if (saMode == SAMode::NONE || !saKeyExchangeInProgress)
     {
         this->CheckForUnsolicitedNull();
     }
@@ -1439,17 +1439,17 @@ IINField OContext::HandleNonReadResponse(const APDUHeader& header, const ser4cpp
     // ============================================================
     case (FunctionCode::AUTH_REQUEST):
     {
-        // When saEnabled=true, AUTHREQUEST is intercepted in ProcessObjects
-        // and never reaches here. This is a safety fallback for saEnabled=false only.
-        if (!saEnabled)
+        // When saMode != NONE, AUTHREQUEST is intercepted in ProcessObjects
+        // and never reaches here. This is a safety fallback for saMode == NONE only.
+        if (saMode == SAMode::NONE)
         {
             this->application->OnAuthRequest(objects, objects.length());
         }
         return IINField::Empty();
     }
     case (FunctionCode::AUTH_REQUEST_NO_ACK):
-        // Same as above - only reached when saEnabled=false
-        if (!saEnabled)
+        // Same as above - only reached when saMode == NONE
+        if (saMode == SAMode::NONE)
         {
             this->application->OnAuthRequestNoAck(objects, objects.length());
         }
