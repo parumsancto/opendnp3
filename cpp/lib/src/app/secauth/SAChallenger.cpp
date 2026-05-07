@@ -13,7 +13,10 @@
 namespace opendnp3
 {
 
-SAChallenger::SAChallenger() {}
+SAChallenger::SAChallenger(SAMode mode)
+    : mode_(mode)
+{
+}
 
 void SAChallenger::SetLogCallback(LogCallback cb)
 {
@@ -31,7 +34,8 @@ std::vector<uint8_t> SAChallenger::GenerateChallenge(uint16_t userNum,
 {
     ++currentCSQ_;
     currentUser_   = userNum;
-    currentAlgo_   = algo;
+    // SAv2: mandatory HMAC-SHA1-trunc10 regardless of the requested algo.
+    currentAlgo_   = (mode_ == SAMode::SAV2) ? MACAlgorithm::HMAC_SHA1_TRUNC_10 : algo;
     currentReason_ = reason;
 
     // Generate 16 bytes of cryptographically random challenge data
@@ -45,7 +49,7 @@ std::vector<uint8_t> SAChallenger::GenerateChallenge(uint16_t userNum,
     Group120Var1 hdr;
     hdr.csq          = currentCSQ_;
     hdr.userNumber   = userNum;
-    hdr.macAlgorithm = static_cast<uint8_t>(algo);
+    hdr.macAlgorithm = static_cast<uint8_t>(currentAlgo_);
     hdr.reason       = static_cast<uint8_t>(reason);
 
     std::vector<uint8_t> bytes = Group120Builder::BuildChallenge(hdr, challengeData_);

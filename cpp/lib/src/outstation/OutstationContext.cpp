@@ -42,6 +42,7 @@
 
 #include "opendnp3/logging/LogLevels.h"
 
+#include <openssl/hmac.h>
 #include <cstring>
 
 namespace opendnp3
@@ -96,10 +97,12 @@ OContext::OContext(const Addresses& addresses,
 
         if (hasUpdateKey)
         {
-            SIMPLE_LOG_BLOCK(this->logger, flags::INFO, "Initializing SAv5 components");
+            FORMAT_LOG_BLOCK(this->logger, flags::INFO,
+                "Initializing SA components (mode=%s)",
+                (saMode == SAMode::SAV2) ? "SAv2" : "SAv5");
 
-            // Create SAKeyManager with Update Key
-            saKeyManager = std::unique_ptr<SAKeyManager>(new SAKeyManager(config.params.saUpdateKey));
+            // Create SAKeyManager with Update Key and SA mode
+            saKeyManager = std::unique_ptr<SAKeyManager>(new SAKeyManager(config.params.saUpdateKey, saMode));
 
             // Set logging callback for SAKeyManager
             auto keyMgrLogCallback = [this](const char* severity, const std::string& message) {
@@ -118,8 +121,8 @@ OContext::OContext(const Addresses& addresses,
             };
             saKeyManager->SetLogCallback(keyMgrLogCallback);
 
-            // Create SAResponder (handles HMAC generation)
-            saResponder = std::unique_ptr<SAResponder>(new SAResponder());
+            // Create SAResponder with SA mode
+            saResponder = std::unique_ptr<SAResponder>(new SAResponder(saMode));
 
             // Set logging callback for SAResponder
             auto responderLogCallback = [this](const char* severity, const std::string& message) {
@@ -138,8 +141,8 @@ OContext::OContext(const Addresses& addresses,
             };
             saResponder->SetLogCallback(responderLogCallback);
 
-            // Create SAChallenger (handles challenge-response validation)
-            saChallenger = std::unique_ptr<SAChallenger>(new SAChallenger());
+            // Create SAChallenger with SA mode
+            saChallenger = std::unique_ptr<SAChallenger>(new SAChallenger(saMode));
 
             // Set logging callback for SAChallenger
             auto challengerLogCallback = [this](const char* severity, const std::string& message) {
@@ -158,7 +161,7 @@ OContext::OContext(const Addresses& addresses,
             };
             saChallenger->SetLogCallback(challengerLogCallback);
 
-            SIMPLE_LOG_BLOCK(this->logger, flags::INFO, "SAv5 components initialized successfully");
+            SIMPLE_LOG_BLOCK(this->logger, flags::INFO, "SA components initialized successfully");
         }
         else
         {
@@ -194,11 +197,13 @@ bool OContext::OnLowerLayerUp()
         pendingCriticalAPDU.clear();
         pendingChallengeAPDU.clear();
         pendingCriticalUserNum = 0;
+        pendingAuthenticatedReady = false;
+        saUnsolBlocked_ = false;
 
         // Reset exchange flag on each new connection.
         saKeyExchangeInProgress = (saMode != SAMode::NONE);
 
-        SIMPLE_LOG_BLOCK(this->logger, flags::INFO, "SAv5 state reset on link up");
+        SIMPLE_LOG_BLOCK(this->logger, flags::INFO, "SA state reset on link up");
     }
 
     this->CheckForTaskStart();
@@ -245,8 +250,17 @@ bool OContext::OnLowerLayerDown()
         pendingCriticalAPDU.clear();
         pendingChallengeAPDU.clear();
         pendingCriticalUserNum = 0;
+        pendingAuthenticatedReady = false;
         sessionControlKeys.clear();
         sessionMonitorKeys.clear();
+        saKeyExchangeInProgress = false;
+        saUnsolBlocked_ = false;
+        awaitingKeyExchangeAfterReply = false;
+        keyExchangeWaitTimer_.cancel();
+        executingAuthenticatedAPDU = false;
+        saSeqNum_ = 0;
+        saPendingResponse_ = false;
+        saPendingResponseLen_ = 0;
 
         SIMPLE_LOG_BLOCK(this->logger, flags::WARN, "SAv5 session keys invalidated due to link down");
     }
@@ -262,6 +276,19 @@ bool OContext::OnTxReady()
     }
 
     this->isTransmitting = false;
+
+    // Drain any SA response (g120v5 or g120v1) that was buffered because isTransmitting
+    // was true when AUTH_REQUEST (g120v4) arrived. Send it now before any deferred
+    // solicited request so the master's key exchange completes in the correct order.
+    if (saPendingResponse_)
+    {
+        saPendingResponse_ = false;
+        const ser4cpp::rseq_t txData(saTxBuffer_.data(),
+                                     static_cast<uint32_t>(saPendingResponseLen_));
+        this->BeginTx(this->addresses.destination, txData);
+        return true;
+    }
+
     this->CheckForTaskStart();
     return true;
 }
@@ -328,6 +355,31 @@ bool OContext::InitiateChallengeForCriticalFunction(const ParsedRequest& request
         return false;
     }
 
+    // If a challenge is already in progress, retransmit the existing g120v1 rather than
+    // generating a new one — a new CSQ would desync the master's expected reply.
+    if (!pendingCriticalAPDU.empty() && !pendingChallengeAPDU.empty())
+    {
+        SIMPLE_LOG_BLOCK(this->logger, flags::WARN,
+            "Repeat critical request while challenge pending — retransmitting g120v1");
+        const size_t retxLen = pendingChallengeAPDU.size();
+        if (retxLen <= SA_TX_BUFFER_SIZE)
+        {
+            std::memcpy(saTxBuffer_.data(), pendingChallengeAPDU.data(), retxLen);
+            if (this->isTransmitting)
+            {
+                saPendingResponseLen_ = retxLen;
+                saPendingResponse_    = true;
+            }
+            else
+            {
+                const ser4cpp::rseq_t txData(saTxBuffer_.data(),
+                                             static_cast<uint32_t>(retxLen));
+                this->BeginTx(this->addresses.destination, txData);
+            }
+        }
+        return true;
+    }
+
     // Store FULL Application Layer fragment: [AppCtrl][FC][objects...]
     // MAC input per IEEE 1815-2012 Table 7-9 requires the complete AL fragment,
     // not just the objects portion that request.objects points to.
@@ -352,9 +404,15 @@ bool OContext::InitiateChallengeForCriticalFunction(const ParsedRequest& request
 
     pendingCriticalUserNum = 1;
 
+    // SAv2 mandates HMAC-SHA1-trunc10; SAChallenger will enforce this internally,
+    // but we pass the correct default here for clarity and logging correctness.
+    const MACAlgorithm challengeAlgo = (saMode == SAMode::SAV2)
+        ? MACAlgorithm::HMAC_SHA1_TRUNC_10
+        : MACAlgorithm::HMAC_SHA256_TRUNC_8;
+
     std::vector<uint8_t> challengeBytes = saChallenger->GenerateChallenge(
         static_cast<uint16_t>(pendingCriticalUserNum),
-        MACAlgorithm::HMAC_SHA256_TRUNC_8,
+        challengeAlgo,
         ChallengeReason::CRITICAL
     );
 
@@ -366,7 +424,8 @@ bool OContext::InitiateChallengeForCriticalFunction(const ParsedRequest& request
         return false;
     }
 
-    this->sol.seq.num = request.header.control.SEQ;
+    // FIX 1: Use saSeqNum_ — do not write sol.seq.num here.
+    this->saSeqNum_ = static_cast<uint8_t>(request.header.control.SEQ);
 
     SendChallengeMessage(challengeBytes);
 
@@ -383,18 +442,14 @@ bool OContext::InitiateChallengeForCriticalFunction(const ParsedRequest& request
 void OContext::SendKeyStatusResponse(uint16_t userNum,
                                      const std::vector<uint8_t>& keyStatusBytes)
 {
-    // Same pattern as SendChallengeMessage: build 4-byte APDU header via
-    // APDUResponse, then manually append pre-serialized g120v5 Key Status bytes.
-    // HeaderWriter::WriteByte does not exist — raw memcpy is the only option.
-    auto response = this->sol.tx.Start();
-    response.SetFunction(FunctionCode::AUTH_RESPONSE);
-    response.SetControl(AppControlField(true, true, false, false, this->sol.seq.num));
-    
-    IINField saIIN = this->GetDynamicIIN(); // events only, no DEVICE_RESTART
-    response.SetIIN(saIIN);
-
-    const ser4cpp::rseq_t apduHeader = response.ToRSeq(); // 4 bytes
-    const size_t headerLen = apduHeader.length();
+    // Build 4-byte APDU header directly into saTxBuffer_ without touching
+    // sol.tx.Start(), which would corrupt sol.tx.GetLastResponse() (a VIEW, not a copy).
+    const IINField dynIIN = this->GetDynamicIIN();
+    saTxBuffer_[0] = 0xC0u | (this->saSeqNum_ & 0x0Fu);                           // AppCtrl (FIX 1)
+    saTxBuffer_[1] = static_cast<uint8_t>(FunctionCode::AUTH_RESPONSE);           // 0x83
+    saTxBuffer_[2] = dynIIN.LSB;                                                   // IIN1
+    saTxBuffer_[3] = dynIIN.MSB;                                                   // IIN2
+    const size_t headerLen = 4;
 
     const size_t totalLen = headerLen + keyStatusBytes.size();
     if (totalLen > SA_TX_BUFFER_SIZE)
@@ -405,17 +460,23 @@ void OContext::SendKeyStatusResponse(uint16_t userNum,
         return;
     }
 
-    std::memcpy(saTxBuffer_.data(),
-                static_cast<const uint8_t*>(apduHeader),
-                headerLen);
 
     std::memcpy(saTxBuffer_.data() + headerLen,
                 keyStatusBytes.data(),
                 keyStatusBytes.size());
 
-    const ser4cpp::rseq_t txData(saTxBuffer_.data(),
-                                 static_cast<uint32_t>(totalLen));
-    this->BeginTx(this->addresses.destination, txData);
+    if (this->isTransmitting)
+    {
+        // Buffer response — will be sent in OnTxReady once current TX completes.
+        saPendingResponseLen_ = totalLen;
+        saPendingResponse_ = true;
+    }
+    else
+    {
+        const ser4cpp::rseq_t txData(saTxBuffer_.data(),
+                                     static_cast<uint32_t>(totalLen));
+        this->BeginTx(this->addresses.destination, txData);
+    }
 
     FORMAT_LOG_BLOCK(this->logger, flags::INFO,
                      "Sent g120v5 Key Status for user %u", userNum);
@@ -427,21 +488,14 @@ void OContext::SendKeyStatusResponse(uint16_t userNum,
 
 void OContext::SendChallengeMessage(const std::vector<uint8_t>& challengeBytes)
 {
-    // Step 1: Use APDUResponse to build the 4-byte APDU header correctly:
-    //   Byte 0: AppControl (FIR=1|FIN=1|CON=0|UNS=0|SEQ)
-    //   Byte 1: FunctionCode = AUTH_RESPONSE (0x83)
-    //   Byte 2: IIN1
-    //   Byte 3: IIN2
-    // NOTE: No HeaderWriter::WriteByte — Group120 bytes are appended manually.
-    auto response = this->sol.tx.Start();
-    response.SetFunction(FunctionCode::AUTH_RESPONSE);
-    response.SetControl(AppControlField(true, true, false, false, this->sol.seq.num));
-    
-    response.SetIIN(this->GetDynamicIIN());
-
-    // ToRSeq() returns the 4 bytes written above (no objects yet)
-    const ser4cpp::rseq_t apduHeader = response.ToRSeq();
-    const size_t headerLen = apduHeader.length();
+    // Build 4-byte APDU header directly into saTxBuffer_ without touching
+    // sol.tx.Start(), which would corrupt sol.tx.GetLastResponse() (a VIEW, not a copy).
+    const IINField dynIIN = this->GetDynamicIIN();
+    saTxBuffer_[0] = 0xC0u | (this->saSeqNum_ & 0x0Fu);                           // AppCtrl (FIX 1)
+    saTxBuffer_[1] = static_cast<uint8_t>(FunctionCode::AUTH_RESPONSE);           // 0x83
+    saTxBuffer_[2] = dynIIN.LSB;                                                   // IIN1
+    saTxBuffer_[3] = dynIIN.MSB;                                                   // IIN2
+    const size_t headerLen = 4;
 
     const size_t totalLen = headerLen + challengeBytes.size();
     if (totalLen > SA_TX_BUFFER_SIZE)
@@ -451,27 +505,27 @@ void OContext::SendChallengeMessage(const std::vector<uint8_t>& challengeBytes)
         return;
     }
 
-    // Step 2: Copy APDU header into persistent TX buffer
-    std::memcpy(saTxBuffer_.data(),
-                static_cast<const uint8_t*>(apduHeader),
-                headerLen);
 
-    // Step 3: Append pre-serialized Group 120 Var 1 bytes
     std::memcpy(saTxBuffer_.data() + headerLen,
                 challengeBytes.data(),
                 challengeBytes.size());
 
-    // Store complete challenge AL fragment for MAC validation (IEEE 1815-2012 Table A-3).
-    // MAC input for g120v2 reply = [this fragment] || [challenged APDU].
-    // Must capture exact bytes transmitted — including IIN at time of sending.
+    // Store complete challenge AL fragment for MAC input (IEEE 1815-2012 Table A-3).
     pendingChallengeAPDU.assign(saTxBuffer_.data(), saTxBuffer_.data() + totalLen);
 
-
-    // Step 4: Transmit directly — AUTH_RESPONSE is never retransmitted (CON=0)
-    //         so we bypass BeginResponseTx / sol.tx.Record intentionally.
-    const ser4cpp::rseq_t txData(saTxBuffer_.data(),
-                                 static_cast<uint32_t>(totalLen));
-    this->BeginTx(this->addresses.destination, txData);
+    if (this->isTransmitting)
+    {
+        // Buffer response — will be sent in OnTxReady once current TX completes.
+        saPendingResponseLen_ = totalLen;
+        saPendingResponse_ = true;
+    }
+    else
+    {
+        // AUTH_RESPONSE is never retransmitted (CON=0): bypass BeginResponseTx / sol.tx.Record.
+        const ser4cpp::rseq_t txData(saTxBuffer_.data(),
+                                     static_cast<uint32_t>(totalLen));
+        this->BeginTx(this->addresses.destination, txData);
+    }
 
     SIMPLE_LOG_BLOCK(this->logger, flags::INFO, "Sent g120v1 Challenge");
 }
@@ -479,6 +533,228 @@ void OContext::SendChallengeMessage(const std::vector<uint8_t>& challengeBytes)
 // ============================================================
 // SAv5 INTEGRATION: Execute pending critical APDU
 // ============================================================
+
+bool OContext::TryHandleAggressiveMode(const ParsedRequest& request)
+{
+    const uint8_t* objData = static_cast<const uint8_t*>(request.objects);
+    const size_t   objLen  = request.objects.length();
+
+    // Detect g120v3: Group=0x78, Variation=0x03
+    if (objLen < 3 || objData[0] != 0x78 || objData[1] != 0x03)
+        return false;
+
+    // Parse DNP3 object header to find payload bounds
+    const uint8_t qualifier = objData[2];
+    size_t g3HeaderLen  = 0;
+    size_t g3PayloadLen = 0;
+
+    if (qualifier == 0x5B)  // 16-bit Free-Format
+    {
+        if (objLen < 6) return false;
+        const uint16_t sz = static_cast<uint16_t>(objData[4])
+                          | (static_cast<uint16_t>(objData[5]) << 8);
+        g3HeaderLen  = 6;
+        g3PayloadLen = static_cast<size_t>(sz);
+    }
+    else if (qualifier == 0x07)  // 1-byte Count
+    {
+        if (objLen < 4) return false;
+        g3HeaderLen  = 4;
+        // GeoSCADA SAv2: payload is CSQ(4)+USR(2) only
+        g3PayloadLen = sizeof(Group120Var3);  // 6 bytes
+    }
+    else
+    {
+        return false;
+    }
+
+    if (g3PayloadLen < sizeof(Group120Var3) || g3HeaderLen + g3PayloadLen > objLen)
+        return false;
+
+    // Parse fixed fields
+    const uint8_t* g3Payload = objData + g3HeaderLen;
+    Group120Var3 var3;
+    var3.csq        = static_cast<uint32_t>(g3Payload[0])
+                    | (static_cast<uint32_t>(g3Payload[1]) <<  8)
+                    | (static_cast<uint32_t>(g3Payload[2]) << 16)
+                    | (static_cast<uint32_t>(g3Payload[3]) << 24);
+    var3.userNumber = static_cast<uint16_t>(g3Payload[4])
+                    | (static_cast<uint16_t>(g3Payload[5]) <<  8);
+
+    // Extract optional MAC value (bytes after fixed CSQ+USR in g120v3 payload)
+    const size_t macBytesOffset = sizeof(Group120Var3);  // 6
+    const bool   hasMac         = (g3PayloadLen > macBytesOffset);
+    std::vector<uint8_t> receivedMAC;
+    if (hasMac)
+        receivedMAC.assign(g3Payload + macBytesOffset, g3Payload + g3PayloadLen);
+
+    const size_t g3TotalSize = g3HeaderLen + g3PayloadLen;
+
+    // Scan for g120v9 (HMAC) at ANY position after g120v3.
+    // GeoSCADA SAv2 format: [g120v3][protected_objects][g120v9]
+    // — g120v9 is at the END, not immediately after g120v3.
+    std::vector<uint8_t> aggressiveMAC;
+    size_t g9Offset    = 0;
+    size_t g9TotalSize = 0;
+    bool hasG9 = false;
+
+    for (size_t pos = g3TotalSize; pos + 2 < objLen && !hasG9; ++pos)
+    {
+        if (objData[pos] != 0x78 || objData[pos + 1] != 0x09)
+            continue;
+        const uint8_t g9Qual = objData[pos + 2];
+        if (g9Qual == 0x5B && pos + 6 <= objLen)
+        {
+            const uint16_t macSize = static_cast<uint16_t>(objData[pos + 4])
+                                   | (static_cast<uint16_t>(objData[pos + 5]) << 8);
+            const size_t macStart = pos + 6;
+            if (macStart + macSize <= objLen)
+            {
+                aggressiveMAC.assign(objData + macStart, objData + macStart + macSize);
+                g9Offset    = pos;
+                g9TotalSize = 6 + static_cast<size_t>(macSize);
+                hasG9 = true;
+                SIMPLE_LOG_BLOCK(this->logger, flags::INFO, "g120v9 HMAC object found");
+            }
+        }
+        else if (g9Qual == 0x07 && pos + 4 <= objLen)
+        {
+            const size_t expectedMacLen = (saMode == SAMode::SAV2) ? 10u : 8u;
+            const size_t macStart = pos + 4;
+            if (macStart + expectedMacLen <= objLen)
+            {
+                aggressiveMAC.assign(objData + macStart, objData + macStart + expectedMacLen);
+                g9Offset    = pos;
+                g9TotalSize = 4 + expectedMacLen;
+                hasG9 = true;
+                SIMPLE_LOG_BLOCK(this->logger, flags::INFO, "g120v9 HMAC object found");
+            }
+        }
+    }
+
+    FORMAT_LOG_BLOCK(this->logger, flags::INFO,
+        "g120v3 Aggressive Mode: CSQ=%u, User=%u",
+        static_cast<unsigned>(var3.csq), static_cast<unsigned>(var3.userNumber));
+
+    const uint16_t userNum = var3.userNumber;
+
+    // Session keys must be valid to use Aggressive Mode
+    if (!saKeyManager || saKeyManager->GetKeyStatus(userNum) != KeyStatus::OK)
+    {
+        FORMAT_LOG_BLOCK(this->logger, flags::WARN,
+            "Aggressive Mode: keys not OK for user %u — falling back to challenge",
+            static_cast<unsigned>(userNum));
+        return false;
+    }
+
+    auto keyIt = sessionControlKeys.find(userNum);
+    if (keyIt == sessionControlKeys.end())
+    {
+        FORMAT_LOG_BLOCK(this->logger, flags::ERR,
+            "Aggressive Mode: no CDSK for user %u", static_cast<unsigned>(userNum));
+        saKeyManager->InvalidateKeys(userNum, KeyStatus::AUTH_FAIL);
+        return false;
+    }
+    const std::array<uint8_t, 32>& controlKey = keyIt->second;
+
+    // MAC verification (per IEEE 1815-2012 Table A-3)
+    if (hasG9 || hasMac)
+    {
+        const std::vector<uint8_t>& macToValidate = hasG9 ? aggressiveMAC : receivedMAC;
+
+        // Reconstruct AppCtrl from parsed control fields.
+        uint8_t alCtrl = 0;
+        if (request.header.control.FIR) alCtrl |= 0x80;
+        if (request.header.control.FIN) alCtrl |= 0x40;
+        if (request.header.control.CON) alCtrl |= 0x20;
+        if (request.header.control.UNS) alCtrl |= 0x10;
+        alCtrl |= static_cast<uint8_t>(request.header.control.SEQ) & 0x0F;
+
+        // Per SAv5 Annex A Table A-9 (and SAv2 §3.1, deferring to the Group 120 library):
+        // MAC input = (full AL fragment of latest g120v1 Challenge)
+        //           || (full AL fragment of this Aggressive Mode request, with ONLY the
+        //               g120v9 MAC value bytes excluded — the g120v9 object header and
+        //               prefix MUST be included)
+        std::vector<uint8_t> macInput;
+        macInput.reserve(pendingChallengeAPDU.size() + 2 + objLen);
+        macInput.insert(macInput.end(), pendingChallengeAPDU.begin(), pendingChallengeAPDU.end());
+        macInput.push_back(alCtrl);
+        macInput.push_back(static_cast<uint8_t>(request.header.function));
+        if (hasG9)
+        {
+            // g9TotalSize = (header+prefix) + (MAC value).  aggressiveMAC.size() = MAC value bytes.
+            // So the g9 header+prefix length is the difference.
+            const size_t g9HeaderPrefixSize = g9TotalSize - aggressiveMAC.size();
+            const size_t macValueStart      = g9Offset + g9HeaderPrefixSize;
+            const size_t macValueEnd        = g9Offset + g9TotalSize;
+
+            // Include all bytes up to (but not including) the MAC value bytes.
+            // This includes g120v3, all protected objects, AND g120v9's header+prefix.
+            macInput.insert(macInput.end(), objData, objData + macValueStart);
+            // Include any bytes that follow the MAC value (typically empty when g120v9 is last).
+            macInput.insert(macInput.end(), objData + macValueEnd, objData + objLen);
+        }
+        else
+        {
+            // Legacy MAC-embedded-in-g120v3 layout: include g120v3 header + CSQ+USR fields,
+            // exclude the MAC bytes inside g120v3, include any following objects.
+            macInput.insert(macInput.end(), objData, objData + g3HeaderLen + macBytesOffset);
+            macInput.insert(macInput.end(), objData + g3TotalSize, objData + objLen);
+        }
+
+        unsigned char digest[EVP_MAX_MD_SIZE];
+        unsigned int  digestLen = 0;
+        const int keyLen = static_cast<int>(saKeyManager->GetSessionKeyLen());
+        size_t truncLen = 0;
+
+        if (saMode == SAMode::SAV2)
+        {
+            HMAC(EVP_sha1(), controlKey.data(), std::min(keyLen, 16),
+                 macInput.data(), macInput.size(), digest, &digestLen);
+            truncLen = 10;
+        }
+        else
+        {
+            HMAC(EVP_sha256(), controlKey.data(), keyLen,
+                 macInput.data(), macInput.size(), digest, &digestLen);
+            truncLen = 8;
+        }
+
+        const size_t expectedLen = std::min(static_cast<size_t>(digestLen), truncLen);
+        if (macToValidate.size() != expectedLen ||
+            std::memcmp(digest, macToValidate.data(), expectedLen) != 0)
+        {
+            SIMPLE_LOG_BLOCK(this->logger, flags::ERR,
+                "Aggressive Mode: MAC validation FAILED — invalidating keys");
+            saKeyManager->InvalidateKeys(userNum, KeyStatus::AUTH_FAIL);
+            return true;
+        }
+        SIMPLE_LOG_BLOCK(this->logger, flags::INFO, "Aggressive Mode: MAC verified");
+    }
+
+    FORMAT_LOG_BLOCK(this->logger, flags::INFO,
+        "Aggressive Mode: accepted for user %u — executing WRITE directly",
+        static_cast<unsigned>(userNum));
+
+    // Build stripped objects: g120v3 removed, g120v9 removed at its actual position.
+    std::vector<uint8_t> strippedBuf;
+    if (hasG9)
+    {
+        strippedBuf.insert(strippedBuf.end(), objData + g3TotalSize, objData + g9Offset);
+        strippedBuf.insert(strippedBuf.end(), objData + g9Offset + g9TotalSize, objData + objLen);
+    }
+    else
+    {
+        strippedBuf.insert(strippedBuf.end(), objData + g3TotalSize, objData + objLen);
+    }
+    ser4cpp::rseq_t strippedObjects(strippedBuf.data(), static_cast<uint32_t>(strippedBuf.size()));
+    ParsedRequest strippedRequest(request.addresses, request.header, strippedObjects);
+
+    executingAuthenticatedAPDU = true;
+    this->state = &this->ProcessNewRequest(strippedRequest);
+    executingAuthenticatedAPDU = false;
+    return true;
+}
 
 void OContext::ExecutePendingCriticalAPDU()
 {
@@ -506,18 +782,76 @@ void OContext::ExecutePendingCriticalAPDU()
     pendingCriticalAPDU.clear();
     pendingCriticalUserNum = 0;
 
-    // Set flag BEFORE ProcessRequest to prevent re-challenge inside OnReceiveSolRequest
+    // Set flag BEFORE ProcessRequest to prevent re-challenge inside OnReceiveSolRequest.
+    // Keep saKeyExchangeInProgress=true here so OnReceive() does NOT call CheckForTaskStart()
+    // between sending the FC=0x81 response and the master's next message. Clearing it here
+    // would race with unsolicited null transmission and corrupt the solicited response.
     executingAuthenticatedAPDU = true;
 
-    bool savedKeyExchange = saKeyExchangeInProgress;  // save flag
-    saKeyExchangeInProgress = false;                  // prevent spurious log
+    // Reset request history so the authenticated APDU is never matched as a
+    // "repeat" of the challenged request (same SEQ=0 + same objects → same digest).
+    // Without this, RequestHistory::FullyEqualsLastRequest() returns true and
+    // OnRepeatNonReadRequest() retransmits sol.tx instead of processing the APDU.
+    this->history.Reset();
+
+    // Safety net: strip g120v3 prefix if it leaked into pendingCriticalAPDU
+    // (happens when Aggressive Mode WRITE arrived while keys were NOT_OK → fell through
+    // to challenge; after key exchange the stored APDU still contains g120v3 prefix).
+    {
+        const uint8_t* objData = static_cast<const uint8_t*>(result.objects);
+        const size_t   objLen  = result.objects.length();
+        if (objLen >= 3 && objData[0] == 0x78 && objData[1] == 0x03)
+        {
+            SIMPLE_LOG_BLOCK(this->logger, flags::WARN,
+                "ExecutePendingCriticalAPDU: stripping leaked g120v3 prefix");
+            const uint8_t q = objData[2];
+            size_t skipLen  = 0;
+            if (q == 0x5B && objLen >= 6)
+            {
+                const uint16_t sz = static_cast<uint16_t>(objData[4])
+                                  | (static_cast<uint16_t>(objData[5]) << 8);
+                skipLen = 6 + static_cast<size_t>(sz);
+            }
+            else if (q == 0x07 && objLen >= 4)
+            {
+                skipLen = 4 + sizeof(Group120Var3);  // 10 bytes: hdr(4)+CSQ(4)+USR(2)
+            }
+            if (skipLen > 0 && skipLen <= objLen)
+            {
+                ser4cpp::rseq_t stripped(objData + skipLen,
+                                         static_cast<uint32_t>(objLen - skipLen));
+                ParsedRequest stripped_req(pendingCriticalAddresses, result.header, stripped);
+                this->ProcessRequest(stripped_req);
+                return;
+            }
+        }
+    }
 
     // Use original request addresses so response routes to master (not back to outstation).
     ParsedRequest request(pendingCriticalAddresses, result.header, result.objects);
     this->ProcessRequest(request);
-    
-    saKeyExchangeInProgress = savedKeyExchange;       // restore
+
     executingAuthenticatedAPDU = false;
+
+    // Clear history after executing authenticated critical APDU.
+    // ProcessNewRequest() just recorded the APDU; without this reset the
+    // master's next identical request (same SEQ + objects after MDRP restart)
+    // is treated as a repeat and silently retransmitted, keeping DEVICE_RESTART
+    // set and locking GeoSCADA in an infinite key-exchange loop.
+    this->history.Reset();
+
+    // SA mode: auto-clear DEVICE_RESTART so GeoSCADA MDRP can proceed to Integrity Poll
+    // instead of treating DEVICE_RESTART in the FC=0x81 response as a full MDRP restart.
+    // In non-SA mode, the master clears DEVICE_RESTART via g80v1 WRITE at MDRP end.
+    // In SA mode, GeoSCADA receives the authenticated FC=0x81 response and sees DEVICE_RESTART
+    // → restarts MDRP from scratch, triggering another key exchange and infinite loop.
+    if (saMode != SAMode::NONE)
+        this->staticIIN.ClearBit(IINBit::DEVICE_RESTART);
+
+    // saKeyExchangeInProgress is cleared in ProcessNewRequest() when master sends the next
+    // solicited request (Integrity Poll). Do not clear it here — clearing it before the
+    // FC=0x81 response is transmitted causes CheckForTaskStart() to fire a NULL unsolicited
+    // immediately, racing with the solicited response and making Geo SCADA see "Invalid Key Status".
 }
 
 // ============================================================
@@ -531,8 +865,10 @@ bool OContext::OnReceiveSAMessage(const ParsedRequest& request)
         return false;
     }
 
-     // Sync application SEQ so AUTH_RESPONSE echoes the request's sequence number
-    this->sol.seq.num = request.header.control.SEQ;
+    // FIX 1: Track SA sequence separately — never write sol.seq.num here.
+    // SA messages always carry SEQ=0; writing sol.seq.num=0 corrupts repeat-request
+    // detection and causes DISABLE_UNSOLICITED to be treated as a retransmit.
+    this->saSeqNum_ = static_cast<uint8_t>(request.header.control.SEQ);
 
     SIMPLE_LOG_BLOCK(this->logger, flags::INFO, "Processing AUTH_REQUEST");
 
@@ -652,8 +988,26 @@ bool OContext::OnReceiveSAMessage(const ParsedRequest& request)
 
             if (valid)
             {
-                SIMPLE_LOG_BLOCK(this->logger, flags::INFO, "g120v2 Reply validated - executing pending APDU");
-                ExecutePendingCriticalAPDU();
+                SIMPLE_LOG_BLOCK(this->logger, flags::INFO,
+                    "g120v2 Reply validated - APDU execution deferred until after key exchange");
+                pendingAuthenticatedReady = true;
+                // Wait for master's key status check (g120v4→g120v5) before executing deferred APDU.
+                // GeoSCADA pipelines [g120v2][g120v4] — g120v4 handler cancels this timer early.
+                // The 200ms fallback fires only if master does not pipeline g120v4.
+                awaitingKeyExchangeAfterReply = true;
+                keyExchangeWaitTimer_.cancel();
+                keyExchangeWaitTimer_ = this->executor->start(
+                    std::chrono::milliseconds(200),
+                    [this]() {
+                        if (awaitingKeyExchangeAfterReply)
+                        {
+                            SIMPLE_LOG_BLOCK(this->logger, flags::INFO,
+                                "Key exchange wait timeout - executing deferred APDU without key exchange");
+                            awaitingKeyExchangeAfterReply = false;
+                            this->CheckForTaskStart();
+                        }
+                    }
+                );
             }
             else
             {
@@ -661,12 +1015,37 @@ bool OContext::OnReceiveSAMessage(const ParsedRequest& request)
                 saKeyManager->InvalidateKeys(var2.userNumber, KeyStatus::AUTH_FAIL);
                 pendingCriticalAPDU.clear();
                 pendingCriticalUserNum = 0;
+                pendingAuthenticatedReady = false;
+                awaitingKeyExchangeAfterReply = false;
+                keyExchangeWaitTimer_.cancel();
             }
             handled = true;
         }
         else
         {
             SIMPLE_LOG_BLOCK(this->logger, flags::ERR, "ParseReply failed - malformed g120v2");
+        }
+        break;
+    }
+
+    // ---- g120v3 Aggressive Mode Request ----
+    // Logging only: actual APDU execution happens in TryHandleAggressiveMode
+    // called from OnReceiveSolRequest when the WRITE+g120v3 arrives as a solicited request.
+    case 3:
+    {
+        Group120Var3 var3;
+        if (Group120Parser::ParseAggressiveModeReq(payload, payloadLen, var3))
+        {
+            FORMAT_LOG_BLOCK(this->logger, flags::INFO,
+                "Received g120v3 Aggressive Mode Request: CSQ=%u, User=%u",
+                static_cast<unsigned>(var3.csq),
+                static_cast<unsigned>(var3.userNumber));
+            handled = true;
+        }
+        else
+        {
+            SIMPLE_LOG_BLOCK(this->logger, flags::ERR,
+                "ParseAggressiveModeReq failed - malformed g120v3");
         }
         break;
     }
@@ -679,19 +1058,25 @@ bool OContext::OnReceiveSAMessage(const ParsedRequest& request)
         {
             SIMPLE_LOG_BLOCK(this->logger, flags::INFO, "Received g120v4 Key Status Request");
 
-            // Mark Key Exchange as started — block unsolicited until confirmation is accepted.
-            saKeyExchangeInProgress = true;
+            // If g120v4 arrives while waiting after a validated g120v2 reply, this is
+            // GeoSCADA's pipelined post-challenge key status check — not a new key exchange.
+            // Session keys are already valid; do not set saKeyExchangeInProgress.
+            const bool postChallengeStatusCheck = (pendingAuthenticatedReady && awaitingKeyExchangeAfterReply);
+            saKeyExchangeInProgress = !postChallengeStatusCheck;
 
-            // Verify MAC before sending new keys (g120v6).
+            // Verify MAC before sending key status (g120v5).
             std::vector<uint8_t> keyStatusBytes;
             auto mdkIt = sessionMonitorKeys.find(var4.userNumber);
             if (mdkIt != sessionMonitorKeys.end() &&
                 saKeyManager->GetKeyStatus(var4.userNumber) == KeyStatus::OK)
             {
+                const MACAlgorithm statusAlgo = (saMode == SAMode::SAV2)
+                    ? MACAlgorithm::HMAC_SHA1_TRUNC_10
+                    : MACAlgorithm::HMAC_SHA256_TRUNC_8;
                 keyStatusBytes = saKeyManager->OnKeyStatusRequestWithMAC(
                     var4.userNumber,
                     mdkIt->second,
-                    MACAlgorithm::HMAC_SHA256_TRUNC_8
+                    statusAlgo
                 );
             }
             else
@@ -701,6 +1086,16 @@ bool OContext::OnReceiveSAMessage(const ParsedRequest& request)
             }
 
             SendKeyStatusResponse(var4.userNumber, keyStatusBytes);
+
+            if (postChallengeStatusCheck)
+            {
+                SIMPLE_LOG_BLOCK(this->logger, flags::INFO,
+                    "g120v4 post-challenge status check: unblocking deferred APDU execution");
+                keyExchangeWaitTimer_.cancel();
+                awaitingKeyExchangeAfterReply = false;
+                // CheckForTaskStart is invoked by OnTxReady after g120v5 TX completes
+            }
+
             handled = true;
         }
         else
@@ -762,24 +1157,33 @@ bool OContext::OnReceiveSAMessage(const ParsedRequest& request)
                 sessionControlKeys[userNum] = controlKey;
                 sessionMonitorKeys[userNum] = monitorKey;
 
-                // Confirm with fresh g120v5 Key Status (OK)
-                // KSQ + HMAC through Monitor Key
+                // Confirm with fresh g120v5 Key Status (OK).
+                // SAv2: no MAC (MAL=0), SAv5: HMAC-SHA256-trunc8 via Monitor Key.
+                const MACAlgorithm confirmAlgo = (saMode == SAMode::SAV2)
+                    ? MACAlgorithm::HMAC_SHA1_TRUNC_10
+                    : MACAlgorithm::HMAC_SHA256_TRUNC_8;
                 auto confirmBytes = saKeyManager->BuildKeyStatusConfirmation(
                     userNum,
                     monitorKey,
-                    MACAlgorithm::HMAC_SHA256_TRUNC_8
+                    confirmAlgo
                 );
                 SendKeyStatusResponse(userNum, confirmBytes);
 
-                // Block unsolicited transmissions until master confirms session keys.
-                // Per IEEE 1815-2012 Table 7-13: master is in "Wait for Key Change
-                // Confirmation" state. Any non-SA ASDU sent before master moves to
-                // Security Idle triggers event 9 ("Rx Inappropriate Non-Critical ASDU"),
-                // causing the master to abort the Key Change and reset the connection.
-                this->shouldCheckForUnsolicited = false;
+                // Key exchange is complete: master transitions to Security Idle upon
+                // receiving g120v5 OK. Clear the flags so CheckForTaskStart / OnReceive
+                // are no longer blocked and the fallback can execute the pending APDU.
+                saKeyExchangeInProgress = false;
+                awaitingKeyExchangeAfterReply = false;
+                keyExchangeWaitTimer_.cancel();
+
+                // Block unsolicited until the next genuine solicited request confirms
+                // the master has processed the key change and is in normal operation.
+                saUnsolBlocked_ = true;
 
                 FORMAT_LOG_BLOCK(this->logger, flags::INFO,
                                  "Session keys updated for user %u", userNum);
+                // pendingAuthenticatedReady (if true) will be picked up by
+                // CheckForTaskStart once the g120v5 TX completes (OnTxReady).
             }
             else
             {
@@ -791,6 +1195,38 @@ bool OContext::OnReceiveSAMessage(const ParsedRequest& request)
         else
         {
             SIMPLE_LOG_BLOCK(this->logger, flags::ERR, "ParseKeyChange failed - malformed g120v6");
+        }
+        break;
+    }
+
+    // ---- g120v7 Authentication Error (master reports auth failure) ----
+    case 7:
+    {
+        Group120Var7 var7;
+        std::vector<uint8_t> errorText;
+        if (Group120Parser::ParseAuthError(payload, payloadLen, var7, errorText))
+        {
+            if (saResponder)
+                saResponder->OnAuthError(var7, errorText);
+
+            std::string text(errorText.begin(), errorText.end());
+            FORMAT_LOG_BLOCK(this->logger, flags::WARN,
+                "Received g120v7 Auth Error: code=%u, user=%u, text=\"%s\"",
+                static_cast<unsigned>(var7.errorCode),
+                static_cast<unsigned>(var7.userNumber),
+                text.c_str());
+
+            // Auth error means master rejected our Key Status — invalidate keys and
+            // reset the key exchange so master can retry.
+            if (saKeyManager)
+                saKeyManager->InvalidateKeys(var7.userNumber, KeyStatus::AUTH_FAIL);
+            saKeyExchangeInProgress = false;
+
+            handled = true;
+        }
+        else
+        {
+            SIMPLE_LOG_BLOCK(this->logger, flags::ERR, "ParseAuthError failed - malformed g120v7");
         }
         break;
     }
@@ -807,78 +1243,59 @@ bool OContext::OnReceiveSAMessage(const ParsedRequest& request)
 
 OutstationState& OContext::OnReceiveSolRequest(const ParsedRequest& request)
 {
+    // Repeat-detection FIRST — before any SA re-challenge check.
+    // A deferred copy of an already-authenticated request must retransmit
+    // the cached response, not trigger a new challenge.
+    if (this->history.HasLastRequest()
+        && this->sol.seq.num.Equals(request.header.control.SEQ)
+        && this->history.FullyEqualsLastRequest(request.header, request.objects))
+    {
+        if (request.header.function == FunctionCode::READ)
+            return this->state->OnRepeatReadRequest(*this, request);
+        return this->state->OnRepeatNonReadRequest(*this, request);
+    }
+
     // ============================================================
-    // SAv5 INTEGRATION: Intercept critical functions for auth
+    // SAv5 INTEGRATION: Intercept NEW critical functions for auth
     // ============================================================
+
+    // Aggressive Mode must be checked before the !executingAuthenticatedAPDU guard.
+    // A prior Aggressive Mode response leaves executingAuthenticatedAPDU=true until reset;
+    // the next critical request may also carry g120v3 and must not be bypassed.
+    if (saMode != SAMode::NONE && saKeyManager && IsCriticalFunction(request.header.function))
+    {
+        if (TryHandleAggressiveMode(request))
+            return *this->state;
+    }
 
     if (saMode != SAMode::NONE
         && saKeyManager
         && IsCriticalFunction(request.header.function)
         && !executingAuthenticatedAPDU
     ) {
-        // Check if session keys are valid for this user
-        // TODO: Extract user number from request authentication object for multiuser functionality
-        uint16_t userNum = 1; // Default user for now
-
+        uint16_t userNum = 1;
         KeyStatus keyStatus = saKeyManager->GetKeyStatus(userNum);
 
         if (keyStatus != KeyStatus::OK)
         {
-            // Keys not initialized or invalid - send g120v5 Key Status(NOT_INIT)
             FORMAT_LOG_BLOCK(this->logger, flags::WARN,
                              "Critical function %s requires authentication but keys not valid (status=%d)",
                              FunctionCodeSpec::to_human_string(request.header.function), static_cast<int>(keyStatus));
-
             std::vector<uint8_t> keyStatusBytes = saKeyManager->OnKeyStatusRequest(userNum);
             SendKeyStatusResponse(userNum, keyStatusBytes);
-
-            // Return to idle state
             return StateIdle::Inst();
         }
 
-        // Keys are valid - initiate challenge-response
         if (InitiateChallengeForCriticalFunction(request))
-        {
-            // Challenge sent, waiting for g120v2 response
             return StateIdle::Inst();
-        }
-        else
-        {
-            // Challenge failed - fall through to normal processing with error
-            SIMPLE_LOG_BLOCK(this->logger, flags::ERR, "Failed to initiate challenge for critical function");
-        }
+
+        SIMPLE_LOG_BLOCK(this->logger, flags::ERR,
+            "SA challenge generation failed - rejecting critical function request");
+        return StateIdle::Inst();
     }
 
-    // Normal processing (non-critical functions or SA disabled)
-
-    // analyze this request to see how it compares to the last request
-    if (this->history.HasLastRequest())
-    {
-        if (this->sol.seq.num.Equals(request.header.control.SEQ))
-        {
-            if (this->history.FullyEqualsLastRequest(request.header, request.objects))
-            {
-                if (request.header.function == FunctionCode::READ)
-                {
-                    return this->state->OnRepeatReadRequest(*this, request);
-                }
-
-                return this->state->OnRepeatNonReadRequest(*this, request);
-            }
-            else // new operation with same SEQ
-            {
-                return this->ProcessNewRequest(request);
-            }
-        }
-        else // completely new sequence #
-        {
-            return this->ProcessNewRequest(request);
-        }
-    }
-    else
-    {
-        return this->ProcessNewRequest(request);
-    }
+    // New request with new SEQ (or SA disabled)
+    return this->ProcessNewRequest(request);
 }
 
 OutstationState& OContext::ProcessNewRequest(const ParsedRequest& request)
@@ -886,14 +1303,19 @@ OutstationState& OContext::ProcessNewRequest(const ParsedRequest& request)
     this->sol.seq.num = request.header.control.SEQ;
     this->history.RecordLastProcessedRequest(request.header, request.objects);
 
-    // If we receive a normal solicited request after Key Exchange, master has accepted
-    // the session keys. Re-enable unsolicited and clear the exchange flag.
-    if (saMode != SAMode::NONE && saKeyExchangeInProgress)
+    // Restore unsolicited on the first genuine solicited request after key exchange.
+    // saUnsolBlocked_ is set exclusively in the g120v6 handler — not touched by the
+    // normal CheckForUnsolicited() flow — so this block fires exactly once per key
+    // exchange cycle, not on every poll.
+    // Skip when executingAuthenticatedAPDU=true — that path replays a deferred request,
+    // not a new master request, and clearing the flag there races with the FC=0x81 TX.
+    if (saMode != SAMode::NONE && saUnsolBlocked_ && !executingAuthenticatedAPDU)
     {
+        saUnsolBlocked_ = false;
         saKeyExchangeInProgress = false;
         this->shouldCheckForUnsolicited = true;
         SIMPLE_LOG_BLOCK(this->logger, flags::INFO,
-            "SAv5 Key Exchange confirmed by master solicited request - resuming unsolicited");
+            "SA Key Exchange confirmed by master solicited request - resuming unsolicited");
     }
 
     if (request.header.function == FunctionCode::READ)
@@ -919,21 +1341,11 @@ bool OContext::ProcessObjects(const ParsedRequest& request)
         return this->ProcessRequestNoAck(request);
     }
 
-    if (this->isTransmitting)
-    {
-        this->deferred.Set(request);
-        return true;
-    }
-
-    if (request.header.function == FunctionCode::CONFIRM)
-    {
-        return this->ProcessConfirm(request);
-    }
-
-    // SAv5 INTEGRATION: Handle AUTHREQUEST directly, bypassing RespondToNonReadRequest.
-    // RespondToNonReadRequest always calls BeginResponseTx after HandleNonReadResponse,
-    // but SA handler (OnReceiveSAMessage) already sends its own response via BeginTx.
-    // Two BeginTx calls in a row cause "Invalid BeginTransmit call, already transmitting".
+    // SAv5 INTEGRATION: Handle AUTH_REQUEST before the isTransmitting check.
+    // DeferredRequest holds only one slot — if AUTH_REQUEST (g120v4) were deferred
+    // alongside a solicited message, the solicited message would overwrite it, losing
+    // the key exchange and leaving GeoSCADA stuck in WAIT_KEY_STATUS.
+    // SA responses buffered while isTransmitting=true are sent in OnTxReady().
     if (request.header.function == FunctionCode::AUTH_REQUEST)
     {
         if (saMode != SAMode::NONE)
@@ -950,6 +1362,17 @@ bool OContext::ProcessObjects(const ParsedRequest& request)
         else
             this->application->OnAuthRequestNoAck(request.objects, request.objects.length());
         return true;
+    }
+
+    if (this->isTransmitting)
+    {
+        this->deferred.Set(request);
+        return true;
+    }
+
+    if (request.header.function == FunctionCode::CONFIRM)
+    {
+        return this->ProcessConfirm(request);
     }
 
     return this->ProcessRequest(request);
@@ -1022,17 +1445,30 @@ void OContext::BeginTx(uint16_t destination, const ser4cpp::rseq_t& message)
 
 void OContext::CheckForTaskStart()
 {
-    // do these checks in order of priority
+    // Execute an authenticated pending APDU BEFORE processing deferred requests.
+    // The deferred queue may hold the same critical request that was already authenticated
+    // (pipelined by master); processing it first would trigger a new SA challenge instead
+    // of executing the authenticated APDU.
+    if (pendingAuthenticatedReady && this->CanTransmit() && !saKeyExchangeInProgress && !awaitingKeyExchangeAfterReply)
+    {
+        pendingAuthenticatedReady = false;
+        SIMPLE_LOG_BLOCK(this->logger, flags::INFO,
+            "Executing authenticated APDU (deferred after g120v2)");
+        ExecutePendingCriticalAPDU();
+        return; // OnTxReady() will call CheckForTaskStart() again for remaining checks
+    }
+
     this->CheckForDeferredRequest();
-    
-    // SAv5 INTEGRATION: block NULL unsolicited during key exchange.
-    // Per IEEE 1815-2012 Table 7-13 event 9: any non-SA ASDU sent while
-    // master is in "Wait for Key Change Confirmation" state causes the master
-    // to abort the Key Change and reset the connection.
-    // OnTxReady() calls CheckForTaskStart() unconditionally (even when
-    // saKeyExchangeInProgress=true), so we must guard CheckForUnsolicitedNull
-    // explicitly here — shouldCheckForUnsolicited alone is not enough.
-    if (saMode == SAMode::NONE || !saKeyExchangeInProgress)
+
+    // FIX 2: Block NULL unsolicited both DURING and AFTER key exchange.
+    // - During exchange (saKeyExchangeInProgress=true): any non-SA ASDU aborts
+    //   the key change per IEEE 1815-2012 Table 7-13 event 9.
+    // - After exchange (saKeyExchangeInProgress=false, shouldCheckForUnsolicited=false):
+    //   a NULL unsolicited with IIN=DEVICE_RESTART causes GeoSCADA to restart MDRP,
+    //   which triggers another key exchange and creates an infinite loop.
+    // shouldCheckForUnsolicited is set back to true in ProcessNewRequest() once the
+    // master sends its first genuine solicited request, confirming it is in normal state.
+    if (saMode == SAMode::NONE || (!saKeyExchangeInProgress && this->shouldCheckForUnsolicited))
     {
         this->CheckForUnsolicitedNull();
     }

@@ -12,6 +12,7 @@
 
 #include "opendnp3/app/secauth/Group120.h"
 #include "opendnp3/app/secauth/Group120Builder.h"
+#include "opendnp3/app/secauth/SAMode.h"
 #include <array>
 #include <map>
 #include <vector>
@@ -34,7 +35,7 @@ namespace opendnp3
 class SAResponder
 {
 public:
-    SAResponder();
+    explicit SAResponder(SAMode mode = SAMode::SAV5);
     ~SAResponder();
 
     /**
@@ -127,6 +128,9 @@ private:
             monitorKey.fill(0);
         }
     };
+
+    /// SA mode (SAV2 or SAV5)
+    SAMode mode_;
 
     /// Session state per user number
     std::map<uint16_t, UserSession> sessions_;

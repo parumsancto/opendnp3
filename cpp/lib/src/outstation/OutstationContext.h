@@ -170,6 +170,14 @@ private:
     bool InitiateChallengeForCriticalFunction(const ParsedRequest& request);
 
     /**
+     * @brief Handle Aggressive Mode request (g120v3 prefix in WRITE request)
+     * @details Per IEEE 1815-2012 Table A-3: master pre-authenticates using session keys
+     *          without a separate challenge exchange.
+     * @return true if handled (either executed or rejected); false if not Aggressive Mode
+     */
+    bool TryHandleAggressiveMode(const ParsedRequest& request);
+
+    /**
      * @brief Send g120v5 Key Status response
      * @details Called in response to g120v4 Key Status Request
      * 
@@ -329,8 +337,27 @@ private:
     /// @brief User number of pending critical request
     uint16_t pendingCriticalUserNum;
 
-    bool saKeyExchangeInProgress = false; // true during SA Key Exchange, blocks unsolicited
-    bool executingAuthenticatedAPDU = false; 
+    bool saKeyExchangeInProgress = false;    // true during SA Key Exchange, blocks unsolicited
+    bool saUnsolBlocked_ = false;            // set after g120v6 OK; cleared on first master poll
+    bool executingAuthenticatedAPDU = false;
+    // Set after g120v2 MAC validation: APDU is authenticated but execution is deferred
+    // until after key exchange (g120v6) so FC=0x81 reaches master in IDLE state.
+    bool pendingAuthenticatedReady = false;
+    // Blocks CheckForTaskStart from firing the deferred APDU until g120v6 completes
+    // or the 200 ms fallback timer fires (non-pipelining masters).
+    bool awaitingKeyExchangeAfterReply = false;
+    exe4cpp::Timer keyExchangeWaitTimer_;
+    // Sequence number echoed in SA AUTH_RESPONSE (g120v5 / g120v1).
+    // Kept separate from sol.seq.num so SA messages (SEQ=0) never corrupt
+    // the solicited sequence number used for repeat-request detection.
+    uint8_t saSeqNum_ = 0;
+
+    // Pending SA response (g120v5 or g120v1) buffered when isTransmitting=true.
+    // AUTH_REQUEST (g120v4) is processed immediately (before isTransmitting check)
+    // but the SA response can't be sent until the current TX completes.
+    // OnTxReady() drains this buffer before CheckForTaskStart().
+    bool saPendingResponse_ = false;
+    size_t saPendingResponseLen_ = 0;
 };
 
 } // namespace opendnp3

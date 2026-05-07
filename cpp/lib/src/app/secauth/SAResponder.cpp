@@ -19,8 +19,9 @@ struct SAResponder::OpenSSLContext
     // Currently unused - HMAC and GMAC use stateless APIs
 };
 
-SAResponder::SAResponder()
-    : sslCtx_(new OpenSSLContext())
+SAResponder::SAResponder(SAMode mode)
+    : mode_(mode),
+      sslCtx_(new OpenSSLContext())
 {
 }
 
@@ -109,11 +110,16 @@ std::vector<uint8_t> SAResponder::CalculateMAC(MACAlgorithm algo,
                                                 const std::array<uint8_t, 32>& key,
                                                 const std::vector<uint8_t>& data)
 {
+    // SAv2: mandatory HMAC-SHA1-trunc10 regardless of the algo field in the challenge.
+    const MACAlgorithm effectiveAlgo = (mode_ == SAMode::SAV2)
+        ? MACAlgorithm::HMAC_SHA1_TRUNC_10
+        : algo;
+
     std::vector<uint8_t> mac;
     unsigned char digest[EVP_MAX_MD_SIZE];
     unsigned int digestLen = 0;
 
-    switch (algo)
+    switch (effectiveAlgo)
     {
     case MACAlgorithm::HMAC_SHA256_TRUNC_8:   // FIX: was TRUNC_16 with truncation to 16
         HMAC(EVP_sha256(), key.data(), 16, data.data(), data.size(), digest, &digestLen);

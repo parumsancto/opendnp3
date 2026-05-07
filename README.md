@@ -21,16 +21,16 @@ You can read about this decision in these blog posts:
 
 ---
 > **⚠️ This is a fork.** The upstream project reached end-of-life in 2022.
-> This fork extends the library with **SAv5 (Secure Authentication v5)** support
+> This fork extends the library with **SAv2 and SAv5 (Secure Authentication)** support
 > for the outstation role, targeting embedded Linux platforms (BeagleBone Black + Comms Cape).
 
-SAv5 Outstation Support (this fork)
+SAv2 and SAv5 Outstation Support (this fork)
 ========
 
-This fork adds a complete implementation of **DNP3 Secure Authentication Version 5**
-([IEEE 1815-2012](https://github.com/parumsancto/opendnp3/blob/release/DNP3-IEEE-Standard.pdf), Section 7) for the outstation role. The implementation is
+This fork adds a complete implementation of **DNP3 Secure Authentication Version 2 and Version 5**
+(IEEE 1815-2010 and IEEE 1815-2012) for the outstation role. The implementation is
 self-contained and does not break backward compatibility — SA is disabled by default
-and activated via `OutstationParams`.
+and activated via `OutstationParams`. The active version is selected at runtime via the `SAMode` enum.
 
 ### Architecture
 
@@ -48,18 +48,20 @@ challenge-response exchange before execution per [IEEE 1815-2012](https://github
 
 ### Configuration
 
-```cpp
-config.outstation.params.saEnabled = true;
+#### C++
 
-// AES-128 Update Key (16 active bytes, pad remaining with zeros):
+```cpp
+// Select SA version: SAMode::NONE (default), SAMode::SAV2, SAMode::SAV5
+config.outstation.params.saMode = SAMode::SAV5;
+
+// SAv2: AES-128 Update Key — 16 bytes (128-bit)
 config.outstation.params.saUpdateKey = {
     0x4D, 0x56, 0x4B, 0xEA, 0x57, 0x15, 0xDD, 0x96,
     0x59, 0xEF, 0x99, 0xA8, 0x95, 0xBB, 0x83, 0x0A,
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    // remaining 16 bytes are unused for SAv2 (zero-padded)
 };
 
-// AES-256 Update Key (all 32 bytes active — auto-detected):
+// SAv5: AES-256 Update Key — 32 bytes (256-bit)
 config.outstation.params.saUpdateKey = {
     0x4D, 0x56, 0x4B, 0xEA, 0x57, 0x15, 0xDD, 0x96,
     0x59, 0xEF, 0x99, 0xA8, 0x95, 0xBB, 0x83, 0x0A,
@@ -68,13 +70,31 @@ config.outstation.params.saUpdateKey = {
 };
 ```
 
-The Key Wrap Algorithm (AES-128 / AES-256) is **auto-detected** from the Update Key:
-if any byte in positions `[16..31]` is non-zero, AES-256 is used automatically.
+#### Environment variables (firmware `.env`)
+
+| Variable | Values | Description |
+|---|---|---|
+| `LOG_LEVEL` | `0`, `1`, `2` | Logging verbosity: `0` = off, `1` = normal, `2` = all |
+| `UART_DATA_BITS` | `7`, `8` | RS-485 data bits |
+| `UART_STOP_BITS` | `0`, `1` | RS-485 stop bits |
+| `UART_PARITY` | `N`, `O`, `E` | RS-485 parity: None, Odd, Even |
+| `UART_BAUD_RATE` | `9600`, `19200`, `38400`, `57600`, `115200` | RS-485 baud rate |
+| `POWER_UNIT_MODBUS_ADDR` | `1`–`254` | Modbus address of the power unit |
+| `DNP3_LOCAL_ADDR` | integer (default `10`) | DNP3 local (outstation) address |
+| `DNP3_REMOTE_ADDR` | integer (default `1`) | DNP3 remote (master) address |
+| `DNP3_SA_MODE` | `none` (default), `sav2`, `sav5` | Selects SA version or disables SA |
+| `DNP3_SA_UPDATE_KEY` | hex string | Update Key: 32 hex chars (SAv2) or 32(64) hex chars (SAv5) |
+| `DNP3_TCP_PORT` | integer (default `20000`) | TCP port for the DNP3 connection |
+
+Key length is validated against the selected mode — mismatch disables SA with an error log.
 
 ### Tested Interoperability
 
-Tested against **zenon SCADA** by [COPA-DATA](https://www.copadata.com/) acting as DNP3 master.  
-Target hardware: **BeagleBone Black** with **Comms Cape** (Debian 12).
+| SA Version | Master Software | Hardware |
+|---|---|---|
+| SAv5 | Zenon SCADA v15 by [COPA-DATA](https://www.copadata.com/) | BeagleBone Black + Comms Cape (Debian 12) |
+| SAv2 | Geo SCADA Expert 2025 by Schneider Electric | BeagleBone Black + Comms Cape (Debian 12) |
+| none | FreyrSCADA v21 | BeagleBone Black + Comms Cape (Debian 12) |
 
 **MAC Algorithms**
 
@@ -98,7 +118,7 @@ Target hardware: **BeagleBone Black** with **Comms Cape** (Debian 12).
 | Feature | Status |
 |---|---|
 | Pre-challenge (normal) mode | ✅ Supported |
-| Aggressive mode | ❌ Not implemented |
+| Aggressive mode | ✅ Supported for SAv2 ❌ Not implemented for SAv5 |
 
 ### Dependencies
 

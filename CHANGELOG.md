@@ -1,3 +1,6 @@
+### 3.4.0 ###
+SAv2 (Secure Authentication v2, IEEE 1815-2010) integration for outstation.
+
 ### 3.3.0 ###
 SAv5 (Secure Authentication v5, IEEE 1815-2012) integration for outstation.
 

@@ -5,6 +5,7 @@
 #pragma once
 
 #include "opendnp3/app/secauth/Group120.h"
+#include "opendnp3/app/secauth/SAMode.h"
 #include <array>
 #include <cstdint>
 #include <functional>
@@ -19,7 +20,7 @@ class SAChallenger
 public:
     using LogCallback = std::function<void(const char* severity, const std::string& msg)>;
 
-    SAChallenger();
+    explicit SAChallenger(SAMode mode = SAMode::SAV5);
     ~SAChallenger() = default;
 
     void SetLogCallback(LogCallback cb);
@@ -48,6 +49,7 @@ private:
         const std::vector<uint8_t>& data,
         int keyLen = 16);
 
+    SAMode mode_;
     LogCallback logCallback_;
     uint32_t currentCSQ_     = 0;
     uint16_t currentUser_    = 0;

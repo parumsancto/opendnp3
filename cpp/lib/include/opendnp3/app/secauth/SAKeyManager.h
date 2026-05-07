@@ -12,6 +12,7 @@
 
 #include "opendnp3/app/secauth/Group120.h"
 #include "opendnp3/app/secauth/Group120Builder.h"
+#include "opendnp3/app/secauth/SAMode.h"
 #include <array>
 #include <map>
 #include <vector>
@@ -47,7 +48,7 @@ public:
      * 
      * @param updateKey 32-byte Update Key (AES-256 key wrap key)
      */
-    explicit SAKeyManager(const std::array<uint8_t, 32>& updateKey);
+    explicit SAKeyManager(const std::array<uint8_t, 32>& updateKey, SAMode mode = SAMode::SAV5);
 
     ~SAKeyManager();
 
@@ -99,9 +100,10 @@ public:
      * @brief Build Key Status Confirmation after successful Key Change
      * @details IEEE 1815-2012 Section 7.5.5.3.3 step 7
      * Sends g120v5 with Status=OK, same KSQ (no increment), and HMAC using monitorKey.
+     * MAC input = full AL fragment of the received g120v6 (SAv2: SHA-1, SAv5: SHA-256).
      * @param userNum   User number
      * @param monitorKey Monitor Direction Session Key (from OnKeyChange output)
-     * @param macAlgo   MAC algorithm value (e.g. HMAC_SHA256_TRUNC_16)
+     * @param macAlgo   MAC algorithm value (e.g. HMAC_SHA1_TRUNC_10 for SAv2)
      */
     std::vector<uint8_t> BuildKeyStatusConfirmation(
         uint16_t userNum,
@@ -148,7 +150,10 @@ public:
     void SetLogCallback(LogCallback callback);
 
 private:
-    /// Update Key (32 bytes, AES-256 key wrap key)
+    /// SA mode (SAV2 or SAV5)
+    SAMode mode_;
+
+    /// Update Key (32 bytes; SAv2 uses only first 16)
     std::array<uint8_t, 32> updateKey;
     uint16_t sessionKeyLen = 16;
 
@@ -202,8 +207,8 @@ private:
     // OpenSSL context (opaque)
     struct OpenSSLContext;
     OpenSSLContext* sslCtx_;
-    // Stores the entire AL fragment of the most recently received g120v6 Key Change.
-    // Used as MAC input for the Key Status Confirmation per IEEE 1815-2012 Table A-4.
+    // Entire AL fragment of received g120v6, used as MAC input in BuildKeyStatusConfirmation.
+    // Both SAv2 and SAv5 compute the confirmation MAC over the full AL fragment.
     std::vector<uint8_t> lastKeyChangeAlFragment;
 };
 

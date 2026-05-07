@@ -59,6 +59,7 @@ set(unittests_src
     ./TestTypedCommandHeader.cpp
     ./TestUpdateBuilder.cpp
     ./TestWriteConversions.cpp
+    ./TestSAv2.cpp
 
     ./utils/APDUHelpers.cpp
     ./utils/APDUHexBuilders.cpp
