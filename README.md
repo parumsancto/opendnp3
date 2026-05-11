@@ -70,24 +70,6 @@ config.outstation.params.saUpdateKey = {
 };
 ```
 
-#### Environment variables (firmware `.env`)
-
-| Variable | Values | Description |
-|---|---|---|
-| `LOG_LEVEL` | `0`, `1`, `2` | Logging verbosity: `0` = off, `1` = normal, `2` = all |
-| `UART_DATA_BITS` | `7`, `8` | RS-485 data bits |
-| `UART_STOP_BITS` | `0`, `1` | RS-485 stop bits |
-| `UART_PARITY` | `N`, `O`, `E` | RS-485 parity: None, Odd, Even |
-| `UART_BAUD_RATE` | `9600`, `19200`, `38400`, `57600`, `115200` | RS-485 baud rate |
-| `POWER_UNIT_MODBUS_ADDR` | `1`–`254` | Modbus address of the power unit |
-| `DNP3_LOCAL_ADDR` | integer (default `10`) | DNP3 local (outstation) address |
-| `DNP3_REMOTE_ADDR` | integer (default `1`) | DNP3 remote (master) address |
-| `DNP3_SA_MODE` | `none` (default), `sav2`, `sav5` | Selects SA version or disables SA |
-| `DNP3_SA_UPDATE_KEY` | hex string | Update Key: 32 hex chars (SAv2) or 32(64) hex chars (SAv5) |
-| `DNP3_TCP_PORT` | integer (default `20000`) | TCP port for the DNP3 connection |
-
-Key length is validated against the selected mode — mismatch disables SA with an error log.
-
 ### Tested Interoperability
 
 | SA Version | Master Software | Hardware |
